@@ -21,7 +21,7 @@ import {
   type ControlCommand,
   type ControlResponse,
   type ControlState,
-} from "../android/control.js";
+} from "../control.js";
 
 const TOKEN = "panel-token-for-tests";
 

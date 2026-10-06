@@ -2,8 +2,6 @@
 
 [中文版](README.md) | [英文版](README_EN.md)
 
-<img src="Android-APP/design/assets/zcode-app-icon.png" width="88" alt="ZCode Proxy icon" />
-
 # ZCode Proxy
 
 **Plug your GLM coding plan into every AI coding tool.**
@@ -13,7 +11,7 @@ A small utility that runs on your own computer. Coding plans from Z.AI / Bigmode
 turns them into standard OpenAI / Anthropic APIs on your machine, so Claude Code,
 Codex, Silly Tavern … can all use your plan quota directly.
 
-[Quick Start](#-quick-start) · [Connect Your Tools](#-connect-your-coding-tools) · [Android App](#-mobile-android) · [FAQ](#-faq)
+[Quick Start](#-quick-start) · [Connect Your Tools](#-connect-your-coding-tools) · [FAQ](#-faq)
 
 </div>
 
@@ -22,12 +20,11 @@ Codex, Silly Tavern … can all use your plan quota directly.
 ## What You Get
 
 - 🧩 **One endpoint, three formats** — OpenAI, Anthropic and Responses (Codex-specific) APIs are all served on local `127.0.0.1:8080`; give each tool whichever format it speaks.
-- 🖥️ **Built-in dashboard** — launching in a terminal gives you a visual panel (headless mode also available); start the proxy, log in and watch logs with simple keypresses, even manageable from your phone.
-- 📱 **Android app** — start/stop the proxy, watch live logs and switch providers on your phone, handy when you're away.
+- 🖥️ **Built-in dashboard** — launching in a terminal gives you a visual panel (headless mode also available); start the proxy, log in and watch logs with simple keypresses.
 - 💬 **Web chat included** — open `/webui` for a local ChatGPT-style chat page to try out models.
 - 🌙 **Off-peak channel & plan grabber** (optional) — a free-quota channel for off-peak hours and automatic claiming of limited trial plans are both built in.
 - 🔌 **In-plan MCP relay** — official ZCode plugin MCPs (Tianyancha / Wind / iFinD…) are relayed to local `/mcp/*` (requires a coding-plan login; `GET /mcp` lists what's available); the built-in web chat can also attach your own MCP servers as tools for the model.
-- 🪟 **Cross-platform** — Windows / macOS / Linux run from one codebase; can also be compiled into a single-file executable or deployed with Docker.
+- 🪟 **Cross-platform** — Windows / macOS / Linux run from one codebase; can also be compiled into a single-file executable.
 
 ## 🚀 Quick Start
 
@@ -126,49 +123,6 @@ curl http://127.0.0.1:8080/v1/chat/completions -H "Content-Type: application/jso
 }'
 ```
 
-## 📱 Mobile (Android)
-
-Download the latest `apk` from [GitHub Releases](https://github.com/TriDefender/zcode-api/releases) and install it. The app mirrors the desktop features: one-tap proxy start, QR-simple configuration, live logs, provider & plan switching, and light/dark themes.
-
-| Home | Logs | Settings | Dark theme |
-|:-:|:-:|:-:|:-:|
-| <img src="docs/images/android/home-light.png" width="210" alt="Home" /> | <img src="docs/images/android/logs.png" width="210" alt="Logs" /> | <img src="docs/images/android/settings.png" width="210" alt="Settings" /> | <img src="docs/images/android/home-dark.png" width="210" alt="Dark theme" /> |
-
-The phone and desktop run the same core: the app embeds the full proxy engine, so **the phone itself is a standalone proxy server** — computers on the same LAN can also connect to the proxy address on your phone.
-
-<details>
-<summary><b>Docker Deployment</b></summary>
-
-```bash
-# Log in on the host with a fixed encryption seed (both providers skip the local callback:
-# open the link on any device and the login completes automatically)
-ZCODE_PROXY_CREDENTIAL_SECRET="a-passphrase-only-you-know" \
-  bun run src/index.ts auth login zai
-
-docker run -d --name zcode-proxy -p 8080:8080 \
-  -v "$(pwd)/config.yaml:/data/config.yaml:ro" \
-  -v "$(HOME)/.zcode-proxy/credentials.json:/home/bun/.zcode-proxy/credentials.json:ro" \
-  -e ZCODE_PROXY_CREDENTIAL_SECRET="a-passphrase-only-you-know" \
-  ghcr.io/tridefender/zcode-proxy:latest
-```
-
-The image is multi-arch (amd64 / arm64) and runs as the `bun` user. With compose:
-
-```yaml
-services:
-  zcode-proxy:
-    image: ghcr.io/tridefender/zcode-proxy:latest
-    ports: ["8080:8080"]
-    volumes:
-      - ./config.yaml:/data/config.yaml:ro
-      - ./credentials.json:/home/bun/.zcode-proxy/credentials.json:ro
-    environment:
-      ZCODE_PROXY_CREDENTIAL_SECRET: "a-passphrase-only-you-know"
-    restart: unless-stopped
-```
-
-</details>
-
 <details>
 <summary><b>Configuration & Environment Variables</b> (works out of the box either way)</summary>
 
@@ -180,9 +134,9 @@ The config file is `config.yaml` in the project root (auto-generated on first st
 | `ZCODE_PROXY_API_KEY` | none | Key clients use to access the proxy (unset = no verification) |
 | `ZCODE_PROVIDER` | `zai` | Provider: `zai` / `bigmodel` |
 | `ZCODE_PROXY_CONFIG` | `config.yaml` | Config file path |
-| `ZCODE_PROXY_CREDENTIAL_SECRET` | machine-specific | Encryption seed for login credentials (fix it when migrating across machines / using Docker) |
+| `ZCODE_PROXY_CREDENTIAL_SECRET` | machine-specific | Encryption seed for login credentials (fix it when migrating across machines) |
 | `ZCODE_LOG_FORMAT` | desktop table | Set to `compact` for single-line logs (good for narrow screens) |
-| `ZCODE_PANEL_ENABLED` | off | Set to `1`/`true` to start a local web panel in headless `serve` mode (including Docker) |
+| `ZCODE_PANEL_ENABLED` | off | Set to `1`/`true` to start a local web panel in headless `serve` mode |
 | `ZCODE_PANEL_TOKEN` | none | Access token for the panel, **required when the panel is enabled** (without it the panel does not start, so the control endpoints are never left open) |
 | `ZCODE_PANEL_PORT` | `8090` | Panel port (bound to `127.0.0.1` only) |
 | `ZCODE_UPDATE_CHECK` | on | Set to `off`/`0` to disable the startup "new version" check (it only notifies, it never updates in place) |
@@ -193,28 +147,6 @@ The plan type (`plan`: `coding-plan` personal / `start-plan` trial) can be toggl
 Without a TUI (cloud server) you can use a browser instead: set `ZCODE_PANEL_ENABLED=1` and `ZCODE_PANEL_TOKEN=<your own random string>`, start the proxy, then forward the port and open `http://127.0.0.1:8090` — it shows status and quota, switches provider/plan, logs in and out, and tails the live logs plus the MCP list. The panel binds loopback only and requires the token on every API call; without a token it does not start. Commands are dispatched in process, so no extra control port is opened. Stopping the proxy from the page does not keep the process alive: SIGTERM/SIGINT and the panel's own shutdown all clear the background timers (auto-claim, captcha pool) before exiting. Logging out from the page also clears the live credential and stops the proxy, so a logged-out account is not spent any further.
 
 **Update notice**: on startup `serve` and the TUI ask GitHub once for the latest release, printing at most one extra log line (press <kbd>u</kbd> in the TUI to re-check manually). It never blocks startup and never affects the proxy: offline, blocked, rate-limited or unexpected answers are ignored silently. A manual check always answers — "already on the latest version" or "check unavailable". Container images are immutable, so the hint names the pull command of the **detected runtime** (Docker: `docker compose pull && docker compose up -d`, Podman: `podman compose pull && podman compose up -d`; when the runtime cannot be told apart it just says "pull the new image and recreate the container") rather than replacing files in place (release artifacts carry no checksums yet, so automatic download-and-replace is not offered). Set `ZCODE_UPDATE_CHECK=off` to disable the check, or `ZCODE_UPDATE_SKIP=v4.7.6` to mute a single tag.
-
-**Reaching the panel from Docker**: the panel listens on the *container's own* `127.0.0.1`, so with the default bridge network `-p 8080:8080` does not expose it, and adding `-p 8090:8090` does not help either (that maps a non-loopback container address). On a Linux server, use host networking so the container shares the host's loopback:
-
-```yaml
-services:
-  zcode-proxy:
-    # keep the existing image / volumes / restart settings
-    network_mode: host        # and drop the original ports: block
-    environment:
-      ZCODE_PROXY_CREDENTIAL_SECRET: "a-passphrase-only-you-know"
-      ZCODE_PANEL_ENABLED: "1"
-      ZCODE_PANEL_TOKEN: "${ZCODE_PANEL_TOKEN:?set a panel token in .env first}"
-      ZCODE_PANEL_PORT: "8090"
-```
-
-Then forward-only tunnel from your machine (`-N` = no shell):
-
-```bash
-ssh -N -L 8090:127.0.0.1:8090 user@host
-```
-
-and open `http://127.0.0.1:8090`. With host networking the proxy port is the host port too, so keep the firewall rules for 8080 as they were and do **not** expose 8090 publicly.
 
 </details>
 

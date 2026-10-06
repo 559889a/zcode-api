@@ -71,7 +71,7 @@ identity:
   # Device identity (X-Device-Mid) — random UUIDv4, generated ONCE and reused
   # forever (mirrors ZCode's telemetry deviceMid; no hardware values involved).
   # Auto-generated into this file at first \`auth login\` or config creation.
-  # Leave empty on Android — the app injects ZCODE_IDENTITY_DEVICE_MID instead.
+  # Env override: ZCODE_IDENTITY_DEVICE_MID (takes precedence over this value).
   deviceMid: ""
 
 # Local client-session inference for cache-affinity experiments.

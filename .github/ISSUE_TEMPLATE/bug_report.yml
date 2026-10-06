@@ -57,7 +57,6 @@ body:
         - 字段顺序 / 格式可疑（不报错但行为异常）
         - 翻译问题（reasoning/thinking、cache_control、tool_use 等丢失或错位）
         - 启动 / 配置加载失败
-        - Android APK 问题（仅 Android）
         - 其他（请在"补充说明"里描述）
     validations:
       required: true
@@ -93,7 +92,6 @@ body:
       options:
         - Bun 源码运行（`bun run src/index.ts`）
         - Bun 编译二进制（zcode-proxy.exe / linux-x64 / darwin-arm64 等）
-        - Android APK
         - 其他
     validations:
       required: true
@@ -108,7 +106,6 @@ body:
         - macOS (Intel)
         - Linux x64
         - Linux arm64
-        - Android
     validations:
       required: true
 

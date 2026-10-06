@@ -2,8 +2,6 @@
 
 [中文版](README.md) | [英文版](README_EN.md)
 
-<img src="Android-APP/design/assets/zcode-app-icon.png" width="88" alt="ZCode Proxy 图标" />
-
 # ZCode Proxy
 
 **把你的 GLM 编码套餐，接进所有 AI 编程工具。**
@@ -12,7 +10,7 @@
 本来只能在官方客户端里用，ZCode Proxy 在本机把它变成标准的 OpenAI / Anthropic 接口，
 于是 Claude Code、Codex、Silly Tavern ……都能直接用上你的套餐额度。
 
-[快速上手](#-一分钟上手) · [接入编码工具](#-把编码工具接上来) · [手机版](#-手机版-android) · [常见问题](#-常见问题)
+[快速上手](#-一分钟上手) · [接入编码工具](#-把编码工具接上来) · [常见问题](#-常见问题)
 
 </div>
 
@@ -21,12 +19,11 @@
 ## 它能帮你做什么
 
 - 🧩 **一个地址，三种格式** —— OpenAI、Anthropic、Responses（Codex 专用）接口都在本机 `127.0.0.1:8080` 上，工具认哪种就给它哪种。
-- 🖥️ **带图形面板** —— 终端启动就是一块可视化面板（也可纯后台运行），启动、登录、看日志点点就行，还能用手机管理。
-- 📱 **安卓 App** —— 手机上启动/停止代理、看实时日志、切换服务商，出门在外也好用。
+- 🖥️ **带图形面板** —— 终端启动就是一块可视化面板（也可纯后台运行），启动、登录、看日志点点就行。
 - 💬 **自带网页聊天** —— 打开 `/webui` 就是一个本地 ChatGPT 风格聊天页，随手测试模型。
 - 🌙 **闲时通道 & 套餐秒抢**（可选）—— 错峰时段的免费额度通道、限量体验套餐自动领取，都是内置功能。
 - 🔌 **套餐内 MCP 反代** —— ZCode 官方插件 MCP（天眼查 / Wind / 同花顺 iFinD…）中继到本机 `/mcp/*`（需 coding-plan 登录，`GET /mcp` 查看列表）；自带网页聊天还能外挂你自己的 MCP 服务器给模型当工具用。
-- 🪟 **全平台** —— Windows / macOS / Linux 一份代码直接跑，也能编译成单文件程序或 Docker 部署。
+- 🪟 **全平台** —— Windows / macOS / Linux 一份代码直接跑，也能编译成单文件程序。
 
 ## 🚀 一分钟上手
 
@@ -125,49 +122,6 @@ curl http://127.0.0.1:8080/v1/chat/completions -H "Content-Type: application/jso
 }'
 ```
 
-## 📱 手机版 (Android)
-
-从 [GitHub Releases](https://github.com/TriDefender/zcode-api/releases) 下载最新的 `apk` 安装即可。
-App 与电脑版功能对应：一键启动代理、扫码级简单配置、实时日志、切换服务商与套餐、亮暗双主题。
-
-| 主页 | 日志 | 设置 | 暗色主题 |
-|:-:|:-:|:-:|:-:|
-| <img src="docs/images/android/home-light.png" width="210" alt="主页" /> | <img src="docs/images/android/logs.png" width="210" alt="日志" /> | <img src="docs/images/android/settings.png" width="210" alt="设置" /> | <img src="docs/images/android/home-dark.png" width="210" alt="暗色主题" /> |
-
-手机和电脑跑的是同一套核心：App 内置了完整的代理引擎，**手机本身就是一个独立的代理服务器**，局域网内的电脑也可以连手机上的代理地址一起用。
-
-<details>
-<summary><b>Docker 部署</b></summary>
-
-```bash
-# 在宿主机上用固定加密种子登录（两种服务商都免本机回调：链接在任何设备打开即可，登录自动完成）
-ZCODE_PROXY_CREDENTIAL_SECRET="一串只有你知道的口令" \
-  bun run src/index.ts auth login zai
-
-docker run -d --name zcode-proxy -p 8080:8080 \
-  -v "$(pwd)/config.yaml:/data/config.yaml:ro" \
-  -v "$(HOME)/.zcode-proxy/credentials.json:/home/bun/.zcode-proxy/credentials.json:ro" \
-  -e ZCODE_PROXY_CREDENTIAL_SECRET="一串只有你知道的口令" \
-  ghcr.io/tridefender/zcode-proxy:latest
-```
-
-镜像多架构（amd64 / arm64），以 `bun` 用户运行。compose 写法：
-
-```yaml
-services:
-  zcode-proxy:
-    image: ghcr.io/tridefender/zcode-proxy:latest
-    ports: ["8080:8080"]
-    volumes:
-      - ./config.yaml:/data/config.yaml:ro
-      - ./credentials.json:/home/bun/.zcode-proxy/credentials.json:ro
-    environment:
-      ZCODE_PROXY_CREDENTIAL_SECRET: "一串只有你知道的口令"
-    restart: unless-stopped
-```
-
-</details>
-
 <details>
 <summary><b>可调的配置与环境变量</b>（改不改都能跑）</summary>
 
@@ -179,9 +133,9 @@ services:
 | `ZCODE_PROXY_API_KEY` | 无 | 客户端访问代理用的密钥（不设=不校验） |
 | `ZCODE_PROVIDER` | `zai` | 服务商 `zai` / `bigmodel` |
 | `ZCODE_PROXY_CONFIG` | `config.yaml` | 配置文件路径 |
-| `ZCODE_PROXY_CREDENTIAL_SECRET` | 机器相关 | 登录凭据的加密种子（跨机器迁移/Docker 时需要固定它） |
+| `ZCODE_PROXY_CREDENTIAL_SECRET` | 机器相关 | 登录凭据的加密种子（跨机器迁移时需要固定它） |
 | `ZCODE_LOG_FORMAT` | 桌面表格 | 设为 `compact` 可得到单行日志（适合窄屏） |
-| `ZCODE_PANEL_ENABLED` | 关 | 设为 `1`/`true` 后，无界面的 `serve` 模式（含 Docker）额外启动一个本机 Web 面板 |
+| `ZCODE_PANEL_ENABLED` | 关 | 设为 `1`/`true` 后，无界面的 `serve` 模式额外启动一个本机 Web 面板 |
 | `ZCODE_PANEL_TOKEN` | 无 | 面板的访问令牌，**开启面板时必填**（不填则面板不启动，避免裸奔的控制接口） |
 | `ZCODE_PANEL_PORT` | `8090` | 面板端口（只监听 `127.0.0.1`） |
 | `ZCODE_UPDATE_CHECK` | 开 | 设为 `off`/`0` 关闭启动时的「有新版」检查（只提示，不自动更新） |
@@ -192,28 +146,6 @@ services:
 服务器这类没有 TUI 的场景，可以让浏览器来看：设 `ZCODE_PANEL_ENABLED=1`、`ZCODE_PANEL_TOKEN=<一段你自己的随机串>` 后启动，再用 SSH 端口转发打开 `http://127.0.0.1:8090` —— 能看状态和额度、切服务商/套餐、登录登出、看实时日志和 MCP 列表。面板只绑回环、每次调 API 都要带 token，没有 token 不启动；命令走进程内分发，不会再额外开一个控制端口。面板上的「Stop proxy」只停代理，进程本身仍能正常退出（SIGTERM/SIGINT 和面板的 shutdown 都会先清掉后台定时器——自动领取、验证码池——再退出）；在面板里登出会同时清掉运行中的凭据并停掉代理，避免登出后新请求还继续花旧账号的额度。
 
 **有新版提示**：`serve` 和 TUI 启动时会异步向 GitHub 查一次 latest release，最多多打一行日志（TUI 里按 <kbd>u</kbd> 可手动重查），不阻塞启动、不影响代理；离线、被挡、限流或返回格式变了都一律静默忽略。手动检查总会给你明确答复（「已是最新」或「检查不可用」）。容器里镜像是不可变的，所以提示给的是**当前运行时的拉取命令**（Docker 为 `docker compose pull && docker compose up -d`，Podman 为 `podman compose pull && podman compose up -d`；认不出运行时则只说「拉取新镜像后重建容器」），而不是自己去替换文件（release 目前也没有校验和，所以不做自动下载替换）。不想让它查就设 `ZCODE_UPDATE_CHECK=off`，某个版本太吵可以 `ZCODE_UPDATE_SKIP=v4.7.6` 忽略。
-
-**Docker 里怎么连面板**：面板只监听**容器自己的** `127.0.0.1`，所以默认 bridge 网络下 `-p 8080:8080` 映射不出来，只补一个 `-p 8090:8090` 也连不上（端口映射到的是容器的非回环地址）。Linux 服务器上用 host 网络，让容器直接用宿主机回环：
-
-```yaml
-services:
-  zcode-proxy:
-    # 保留现有 image / volumes / restart 等配置
-    network_mode: host        # host 模式下删掉原来的 ports:
-    environment:
-      ZCODE_PROXY_CREDENTIAL_SECRET: "一串只有你知道的口令"
-      ZCODE_PANEL_ENABLED: "1"
-      ZCODE_PANEL_TOKEN: "${ZCODE_PANEL_TOKEN:?请先在 .env 里设置面板 token}"
-      ZCODE_PANEL_PORT: "8090"
-```
-
-然后在本机建一条只转发的隧道（`-N` 不开 shell）：
-
-```bash
-ssh -N -L 8090:127.0.0.1:8090 user@host
-```
-
-再打开 `http://127.0.0.1:8090`。host 网络下代理主端口也直接占用宿主机端口，安全组/防火墙照旧按原来放行 8080，**不要**对外放行 8090。
 
 </details>
 
