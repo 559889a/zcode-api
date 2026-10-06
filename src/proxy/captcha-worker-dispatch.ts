@@ -93,7 +93,11 @@ function isEntryUnavailableError(err: unknown): boolean {
   const e = err as { code?: string; message?: string };
   return (
     e?.code === "ERR_MODULE_NOT_FOUND" ||
-    /cannot find module|module not found/i.test(String(e?.message ?? ""))
+    // Node's text ("Cannot find module") and Bun's loader BuildMessage
+    // ("ModuleNotFound resolving "<path>" (entry point)") — the latter is
+    // camelCase with no spaces and carries no code (observed on Windows,
+    // where the short path resolves but the loader still rejects it).
+    /cannot find module|module not found|modulenotfound/i.test(String(e?.message ?? ""))
   );
 }
 
