@@ -101,12 +101,14 @@ export class ClaimScheduler {
       // 404 = campaign endpoint not deployed yet (the expected pre-launch state
       // for weekend plans); poll at normal cadence instead of error backoff.
       if (err instanceof ClaimPreviewError && err.status === 404) {
+        this.log(`claim: preview 404 — campaign not deployed`);
         this.holdUntil = nowMs + this.deps.config.pollIntervalMs;
         return { action: "idle" };
       }
       return this.errorBackoff(`preview failed: ${(err as Error).message}`);
     }
     if (plans.length === 0) {
+      this.log(`claim: preview ok, 0 claimable plans`);
       this.holdUntil = nowMs + this.deps.config.pollIntervalMs;
       return { action: "idle" };
     }
@@ -114,6 +116,8 @@ export class ClaimScheduler {
     const target = this.pickPlan(plans);
     if (!target) {
       // Configured planId not in the current preview list — plain poll cadence.
+      const ids = plans.map((p) => p.planId).join(", ");
+      this.log(`claim: preview has ${plans.length} plan(s) [${ids}] — none matches configured planId`);
       this.holdUntil = nowMs + this.deps.config.pollIntervalMs;
       return { action: "idle" };
     }

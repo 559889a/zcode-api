@@ -165,12 +165,13 @@ describe("ClaimScheduler.tick", () => {
     expect((res2 as { action: string }).action).toBe("claimed");
   });
 
-  it("preview 404 (campaign not deployed) idles at poll cadence without error log", async () => {
+  it("preview 404 (campaign not deployed) idles at poll cadence with an info log, not error backoff", async () => {
     const h = makeHarness({ pollIntervalMs: 120_000, cooldownMs: 30_000 });
     h.previewError = new ClaimPreviewError("claim preview failed (404): 404 page not found", 404, 404);
     const res = await h.scheduler.tick();
     expect(res).toEqual({ action: "idle" });
-    expect(h.logs).toHaveLength(0);
+    // Informational idle line (operator visibility), NOT an errorBackoff entry.
+    expect(h.logs).toEqual(["claim: preview 404 — campaign not deployed"]);
     h.nowMs += 119_999;
     expect(await h.scheduler.tick()).toEqual({ action: "skipped_hold" });
   });
