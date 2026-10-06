@@ -19,6 +19,13 @@ export interface Credential {
   userId?: string;
   /** JWT token for start-plan (zcode.z.ai). Present when login captured the ZCode plan token. */
   jwt?: string;
+  /**
+   * Per-account plan override (panel-edited). Absent = follow the global
+   * `config.plan` default.
+   */
+  plan?: "coding-plan" | "start-plan";
+  /** Per-account exit-node label override (panel-edited). Absent = auto round-robin. */
+  proxy?: string;
 }
 
 /**

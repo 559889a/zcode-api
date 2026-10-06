@@ -10,6 +10,7 @@
  */
 import type { ProviderId } from "./provider/types.js";
 import type { Credential } from "./auth/types.js";
+import type { PoolStatusEntry } from "./pool/pool.js";
 import {
   ZaiOAuthClient,
   BigmodelPollOAuthClient,
@@ -34,11 +35,14 @@ export type ControlCommand =
   | { cmd: "stopProxy" }
   | { cmd: "getLogs"; since?: number }
   | { cmd: "quota" }
+  | { cmd: "poolStatus" }
+  | { cmd: "removeAccount"; id: string }
+  | { cmd: "updateAccount"; id: string; plan?: PlanTier; proxy?: string }
   | { cmd: "shutdown" };
 
 /** Successful response envelope. */
 export type ControlOk =
-  | { ok: true; state: "running"; provider: ProviderId; plan: PlanTier; proxyPort: number; loggedIn: boolean }
+  | { ok: true; state: "running"; provider: ProviderId; plan: PlanTier; proxyPort: number; loggedIn: boolean; oauth?: OAuthStatusSlice }
   | { ok: true; event: "oauthUrl"; authorizeUrl: string; callbackPort: number }
   | { ok: true; event: "loginOk"; provider: ProviderId }
   | { ok: true; event: "loggedOut" }
@@ -47,6 +51,9 @@ export type ControlOk =
   | { ok: true; event: "proxyStopped" }
   | { ok: true; event: "logs"; nextSince: number; lines: string[] }
   | { ok: true; event: "quota"; quota: QuotaSnapshot }
+  | { ok: true; event: "pool"; pool: PoolStatusEntry[]; nodes: string[]; threshold: number }
+  | { ok: true; event: "accountRemoved"; id: string }
+  | { ok: true; event: "accountUpdated"; id: string; plan?: PlanTier; proxy?: string }
   | { ok: true; event: "shuttingDown" };
 
 /** Failure response envelope. */
@@ -78,7 +85,30 @@ export interface ControlState {
     client: OAuthFlowClient;
     callbackUrl: string;
     state: string;
+    /** Epoch ms when the flow started (panel age display). */
+    startedAt: number;
   };
+  /**
+   * Outcome of the most recent FINISHED flow (completed or failed), so the
+   * panel can show a result after `activeOauth` is gone. Replaced by the next
+   * startOAuth; never carries credentials.
+   */
+  lastOauth?: {
+    provider: ProviderId;
+    startedAt: number;
+    finishedAt: number;
+    state: "completed" | "failed";
+    error?: string;
+  };
+}
+
+/** Wire-safe OAuth flow status derived from `ControlState` (no credentials). */
+export interface OAuthStatusSlice {
+  provider: ProviderId;
+  startedAt: number;
+  state: "pending" | "completed" | "failed";
+  error?: string;
+  finishedAt?: number;
 }
 
 /** Context passed to the dispatcher for hook wiring + log access. */
@@ -88,6 +118,22 @@ export interface HandlerContext {
   onSetConfig?: (changes: { provider?: ProviderId; plan?: PlanTier }) => Promise<ConfigUpdateResult>;
   onShutdown?: () => Promise<void> | void;
   onQuota?: () => Promise<QuotaSnapshot>;
+  /** Live account-pool status for the panel card (wire-safe, no credentials). */
+  getPoolStatus?: () => PoolStatusEntry[];
+  /** Exit-node labels available for per-account binding, in node order. */
+  getPoolNodes?: () => string[];
+  /** Consecutive key errors before an account cools down (pool config). */
+  getPoolThreshold?: () => number;
+  /** Remove a pool account (oauth-store entry). Config accounts are edited in config.yaml instead. */
+  onRemoveAccount?: (id: string) => Promise<{ ok: true } | { ok: false; error: string }>;
+  /**
+   * Update per-account settings (plan tier, pinned exit node) on an oauth-store
+   * account. `proxy: ""` clears the pin. Config accounts are config.yaml-only.
+   */
+  onUpdateAccount?: (
+    id: string,
+    changes: { plan?: PlanTier; proxy?: string },
+  ) => Promise<{ ok: true; plan?: PlanTier; proxy?: string } | { ok: false; error: string }>;
   logBuffer: LogBuffer;
   /** Overrides login-client construction (tests inject offline clients). */
   createLoginClient?: (provider: ProviderId) => OAuthFlowClient;
@@ -149,6 +195,28 @@ export function createControlDispatcher(
   return (cmd) => dispatch(cmd, state, ctx);
 }
 
+/**
+ * Build the wire-safe OAuth status slice for `status` responses: the active
+ * flow while in flight, otherwise the last finished outcome (until the next
+ * startOAuth replaces it).
+ */
+function oauthStatusSlice(state: ControlState): { oauth?: OAuthStatusSlice } {
+  if (state.activeOauth) {
+    return { oauth: { provider: state.activeOauth.client.provider, startedAt: state.activeOauth.startedAt, state: "pending" } };
+  }
+  const last = state.lastOauth;
+  if (!last) return {};
+  return {
+    oauth: {
+      provider: last.provider,
+      startedAt: last.startedAt,
+      state: last.state,
+      ...(last.error ? { error: last.error } : {}),
+      finishedAt: last.finishedAt,
+    },
+  };
+}
+
 async function dispatch(
   cmd: ControlCommand,
   state: ControlState,
@@ -164,6 +232,7 @@ async function dispatch(
         plan: state.plan,
         proxyPort: state.proxyPort,
         loggedIn: cred != null,
+        ...oauthStatusSlice(state),
       };
     }
 
@@ -173,6 +242,7 @@ async function dispatch(
         await state.activeOauth.client.close().catch(() => {});
         state.activeOauth = undefined;
       }
+      state.lastOauth = undefined;
       // Both providers use the server-mediated poll login (ZCode 3.12.3
       // default) — no local callback; the flow completes server-side.
       const client: OAuthFlowClient = ctx.createLoginClient
@@ -181,6 +251,7 @@ async function dispatch(
           ? new BigmodelPollOAuthClient()
           : new ZaiOAuthClient();
       const started = await client.start();
+      const beganAt = Date.now();
       const callbackPort = started.callbackUrl
         ? Number(new URL(started.callbackUrl).port) || 80
         : 0;
@@ -188,16 +259,25 @@ async function dispatch(
         client,
         callbackUrl: started.callbackUrl,
         state: started.state,
+        startedAt: beganAt,
       };
       client.complete(started).then(async (tokens) => {
         const resolver = new KeyResolver();
         const cred: Credential = await resolver.resolveCodingPlanCredential(tokens.accessToken, cmd.provider, tokens.userId);
         if (tokens.jwt) cred.jwt = tokens.jwt;
         await saveCredential(cred);
+        state.lastOauth = { provider: cmd.provider, startedAt: beganAt, finishedAt: Date.now(), state: "completed" };
         console.log(`OAuth completed for ${cmd.provider}`);
       }).catch((err: unknown) => {
         // Timeouts / rejections are expected when the user abandons the
         // browser; nothing to surface beyond the log buffer.
+        state.lastOauth = {
+          provider: cmd.provider,
+          startedAt: beganAt,
+          finishedAt: Date.now(),
+          state: "failed",
+          error: (err as Error)?.message ?? String(err),
+        };
         console.error(`OAuth flow ended without success: ${(err as Error)?.message ?? String(err)}`);
       }).finally(() => {
         // MUST run on rejection too — otherwise the callback port leaks until
@@ -287,6 +367,34 @@ async function dispatch(
       } catch (err) {
         return { ok: false, error: (err as Error).message };
       }
+    }
+
+    case "poolStatus": {
+      if (!ctx.getPoolStatus) return { ok: false, error: "pool_unavailable" };
+      return {
+        ok: true,
+        event: "pool",
+        pool: ctx.getPoolStatus(),
+        nodes: ctx.getPoolNodes?.() ?? [],
+        threshold: ctx.getPoolThreshold?.() ?? 10,
+      };
+    }
+
+    case "removeAccount": {
+      if (!ctx.onRemoveAccount) return { ok: false, error: "pool_unavailable" };
+      const result = await ctx.onRemoveAccount(cmd.id);
+      if (!result.ok) return result;
+      return { ok: true, event: "accountRemoved", id: cmd.id };
+    }
+
+    case "updateAccount": {
+      if (!ctx.onUpdateAccount) return { ok: false, error: "pool_unavailable" };
+      const result = await ctx.onUpdateAccount(cmd.id, {
+        ...(cmd.plan ? { plan: cmd.plan } : {}),
+        ...(cmd.proxy !== undefined ? { proxy: cmd.proxy } : {}),
+      });
+      if (!result.ok) return result;
+      return { ok: true, event: "accountUpdated", id: cmd.id, ...(result.plan ? { plan: result.plan } : {}), ...(result.proxy !== undefined ? { proxy: result.proxy } : {}) };
     }
 
     case "shutdown": {

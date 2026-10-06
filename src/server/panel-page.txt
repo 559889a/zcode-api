@@ -7,12 +7,14 @@
     <title>ZCode Proxy · Panel</title>
     <style>
       :root {
-        --bg: #f6f6f7;
+        --bg: #f4f4f5;
         --card: #ffffff;
-        --text: #1a1a1a;
-        --muted: #6e6e6e;
-        --border: #e5e5e5;
+        --text: #18181b;
+        --muted: #71717a;
+        --border: #e4e4e7;
+        --soft: #fafafa;
         --accent: #6366f1;
+        --accent-soft: rgba(99, 102, 241, 0.12);
         --ok: #16a34a;
         --warn: #d97706;
         --danger: #dc2626;
@@ -20,11 +22,13 @@
       }
       @media (prefers-color-scheme: dark) {
         :root {
-          --bg: #171717;
-          --card: #212121;
-          --text: #ececec;
-          --muted: #9a9a9a;
-          --border: #3a3a3a;
+          --bg: #131315;
+          --card: #1d1d20;
+          --text: #ececef;
+          --muted: #9b9ba3;
+          --border: #34343a;
+          --soft: #26262a;
+          --accent-soft: rgba(99, 102, 241, 0.22);
         }
       }
       * { box-sizing: border-box; }
@@ -40,55 +44,140 @@
         align-items: center;
         gap: 10px;
         flex-wrap: wrap;
-        max-width: 900px;
-        margin: 0 auto 16px;
+        max-width: 1080px;
+        margin: 0 auto 14px;
       }
-      header h1 { font-size: 17px; margin: 0; }
+      header h1 { font-size: 16px; margin: 0; letter-spacing: 0.01em; }
       header .spacer { flex: 1; }
       .dot { width: 9px; height: 9px; border-radius: 50%; background: var(--muted); display: inline-block; }
       .dot.ok { background: var(--ok); }
       .dot.bad { background: var(--danger); }
-      main { max-width: 900px; margin: 0 auto; display: grid; gap: 14px; }
+      main { max-width: 1080px; margin: 0 auto; display: grid; gap: 14px; }
       section {
         background: var(--card);
         border: 1px solid var(--border);
         border-radius: var(--radius);
         padding: 14px 16px;
+        min-width: 0;
       }
       section h2 {
-        font-size: 12px;
+        font-size: 11px;
         text-transform: uppercase;
-        letter-spacing: 0.06em;
+        letter-spacing: 0.08em;
         color: var(--muted);
         margin: 0 0 10px;
       }
+      .sub { font-size: 12px; color: var(--muted); margin: -6px 0 10px; }
+      .cols { display: grid; grid-template-columns: minmax(0, 7fr) minmax(0, 5fr); gap: 14px; }
+      @media (max-width: 920px) { .cols { grid-template-columns: 1fr; } }
       .row { display: flex; align-items: center; gap: 8px; flex-wrap: wrap; }
       .row + .row { margin-top: 8px; }
-      .kv { display: grid; grid-template-columns: 120px 1fr; gap: 4px 10px; }
-      .kv dt { color: var(--muted); }
-      .kv dd { margin: 0; overflow-wrap: anywhere; }
       input, select, button {
         font: inherit;
         color: inherit;
         background: transparent;
         border: 1px solid var(--border);
         border-radius: 8px;
-        padding: 6px 10px;
+        padding: 5px 10px;
       }
       input, select { background: var(--bg); }
       button { cursor: pointer; }
       button.primary { background: var(--accent); border-color: var(--accent); color: #fff; }
+      button.ghost { border-color: transparent; color: var(--muted); padding: 5px 6px; }
+      button.ghost:hover { color: var(--danger); }
       button:disabled { opacity: 0.45; cursor: not-allowed; }
-      #token { width: 260px; }
+      select.compact, button.compact { padding: 3px 6px; font-size: 12px; border-radius: 6px; }
+      #token { width: 220px; }
       .muted { color: var(--muted); }
       .danger { color: var(--danger); }
-      .bar { height: 8px; border-radius: 4px; background: var(--border); overflow: hidden; margin: 4px 0; }
-      .bar > i { display: block; height: 100%; background: var(--accent); }
+      .ok-text { color: var(--ok); }
+
+      /* status strip */
+      .strip { display: flex; align-items: center; gap: 10px; flex-wrap: wrap; padding: 10px 16px; }
+      .chips { display: flex; gap: 6px; flex-wrap: wrap; flex: 1; }
+      .chip {
+        font-size: 12px;
+        padding: 3px 10px;
+        border-radius: 999px;
+        background: var(--soft);
+        border: 1px solid var(--border);
+        color: var(--muted);
+        white-space: nowrap;
+      }
+      .chip b { color: var(--text); font-weight: 600; }
+
+      /* badges */
+      .badge {
+        display: inline-block;
+        font-size: 11px;
+        line-height: 1;
+        padding: 3px 7px;
+        border-radius: 999px;
+        background: var(--soft);
+        border: 1px solid var(--border);
+        color: var(--muted);
+        vertical-align: 1px;
+      }
+      .badge.accent { background: var(--accent-soft); border-color: transparent; color: var(--accent); }
+      .badge.bad { color: var(--danger); border-color: var(--danger); }
+
+      /* account rows */
+      .acc {
+        display: flex;
+        align-items: center;
+        gap: 10px;
+        padding: 9px 0;
+        border-bottom: 1px solid var(--border);
+        flex-wrap: wrap;
+      }
+      .acc:last-child { border-bottom: none; }
+      .acc .mark { width: 16px; text-align: center; color: var(--muted); flex: none; }
+      .acc .who { flex: 1 1 200px; min-width: 0; }
+      .acc .who .name { font-weight: 600; }
+      .acc .who .meta { margin-top: 2px; display: flex; gap: 5px; flex-wrap: wrap; align-items: center; font-size: 12px; color: var(--muted); }
+      .acc .controls { display: flex; gap: 6px; align-items: center; flex-wrap: wrap; }
+      .acc .controls label { font-size: 11px; color: var(--muted); }
+      .strike { font-size: 12px; color: var(--muted); }
+
+      /* quota */
+      .qa { padding: 10px 0; border-bottom: 1px dashed var(--border); }
+      .qa:last-child { border-bottom: none; }
+      .qa-head { display: flex; gap: 6px; align-items: center; flex-wrap: wrap; margin-bottom: 4px; }
+      .qa-head .name { font-weight: 600; }
+      .qrow {
+        display: grid;
+        grid-template-columns: minmax(80px, 1fr) auto 130px;
+        gap: 4px 10px;
+        align-items: center;
+        padding: 3px 0;
+      }
+      .qrow .qname { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; font-size: 13px; }
+      .qrow .qnum { text-align: right; font-size: 12px; color: var(--muted); white-space: nowrap; }
+      .qrow .qexp { grid-column: 1 / -1; font-size: 11px; color: var(--muted); }
+      .bar { height: 6px; border-radius: 3px; background: var(--border); overflow: hidden; }
+      .bar > i { display: block; height: 100%; background: var(--accent); border-radius: 3px; }
+      .bar > i.ok { background: var(--ok); }
+      .bar > i.warn { background: var(--warn); }
+      .bar > i.bad { background: var(--danger); }
+      .err { color: var(--danger); font-size: 12px; padding: 2px 0; }
+
+      /* settings summary */
+      .kv { display: grid; grid-template-columns: 170px 1fr; gap: 6px 12px; margin: 0 0 12px; }
+      .kv dt { color: var(--muted); }
+      .kv dd { margin: 0; overflow-wrap: anywhere; }
+
+      /* login/feedback lines: block + break so long authorize URLs wrap inside the card */
+      #oauth-status, #login-body {
+        display: block;
+        margin-top: 8px;
+        font-size: 12px;
+        overflow-wrap: anywhere;
+      }
       #logs {
         margin: 0;
-        max-height: 260px;
+        max-height: 300px;
         overflow: auto;
-        background: var(--bg);
+        background: var(--soft);
         border: 1px solid var(--border);
         border-radius: 8px;
         padding: 8px 10px;
@@ -100,7 +189,7 @@
       pre.raw {
         max-height: 220px;
         overflow: auto;
-        background: var(--bg);
+        background: var(--soft);
         border: 1px solid var(--border);
         border-radius: 8px;
         padding: 8px 10px;
@@ -115,62 +204,57 @@
       <span id="dot" class="dot"></span>
       <span id="conn" class="muted">not connected</span>
       <span class="spacer"></span>
-      <input id="token" type="password" placeholder="ZCODE_PANEL_TOKEN" autocomplete="off" />
+      <input id="token" type="password" placeholder="panel token" autocomplete="off" />
       <button id="connect" class="primary">Connect</button>
     </header>
 
     <main>
-      <section>
-        <h2>Status</h2>
-        <dl class="kv">
-          <dt>Provider</dt><dd id="s-provider">—</dd>
-          <dt>Plan</dt><dd id="s-plan">—</dd>
-          <dt>Proxy port</dt><dd id="s-port">—</dd>
-          <dt>Logged in</dt><dd id="s-login">—</dd>
-        </dl>
+      <section class="strip">
+        <div class="chips">
+          <span class="chip" id="c-proxy">proxy <b>—</b></span>
+          <span class="chip" id="c-pool">accounts <b>—</b></span>
+          <span class="chip" id="c-exit">exit nodes <b>—</b></span>
+          <span class="chip" id="c-default">defaults <b>—</b></span>
+        </div>
         <div class="row">
           <button id="start">Start proxy</button>
           <button id="stop">Stop proxy</button>
           <button id="refresh">Refresh</button>
+          <span id="action-note" class="muted"></span>
         </div>
       </section>
 
-      <section>
-        <h2>Quota <span class="muted">(manual refresh — the billing gateway rate-limits polling)</span></h2>
-        <div class="row">
-          <button id="quota">Load quota</button>
-          <span id="quota-age" class="muted"></span>
-        </div>
-        <div id="quota-body" class="muted">No data yet.</div>
-      </section>
+      <div class="cols">
+        <section>
+          <h2>Accounts</h2>
+          <div class="sub">Sequential rotation — one account serves until it fails, ▶ marks the current one. Plan and exit node are per-account; provider is inherent to the key.</div>
+          <div id="pool-body" class="muted">No data yet.</div>
+          <div class="row" style="margin-top: 12px">
+            <button id="login">Login (zai)</button>
+            <button id="login-bm">Login (bigmodel)</button>
+            <button id="logout">Logout all</button>
+          </div>
+          <div id="oauth-status"></div>
+          <div id="login-body" class="muted"></div>
+        </section>
+
+        <section>
+          <h2>Quota</h2>
+          <div class="row">
+            <button id="quota">Load quota</button>
+            <span id="quota-age" class="muted"></span>
+          </div>
+          <div id="quota-body" class="muted">No data yet.</div>
+        </section>
+      </div>
 
       <section>
-        <h2>Config</h2>
-        <div class="row">
-          <label for="cfg-provider" class="muted">Provider</label>
-          <select id="cfg-provider">
-            <option value="zai">zai</option>
-            <option value="bigmodel">bigmodel</option>
-          </select>
-          <label for="cfg-plan" class="muted">Plan</label>
-          <select id="cfg-plan">
-            <option value="coding-plan">coding-plan</option>
-            <option value="start-plan">start-plan</option>
-          </select>
-          <button id="apply">Apply</button>
-          <span id="cfg-note" class="muted"></span>
+        <h2>Settings</h2>
+        <dl class="kv" id="cfg-summary"></dl>
+        <div class="sub" style="margin-top: 8px">
+          Manual api-key accounts (<code>pool.accounts</code>), the default provider/plan, and the exit-node list are
+          declared in config.yaml — everything above is live state. Per-account plan and exit node are edited on each account row.
         </div>
-        <div class="row muted">Writes back to config.yaml; the proxy must be stopped first.</div>
-      </section>
-
-      <section>
-        <h2>Account</h2>
-        <div class="row">
-          <button id="login">Login (zai)</button>
-          <button id="login-bm">Login (bigmodel)</button>
-          <button id="logout">Logout</button>
-        </div>
-        <div id="login-body" class="row muted"></div>
       </section>
 
       <section>
@@ -198,6 +282,9 @@
       let lastQuotaAt = 0;
       let logCursor = 0;
       let loggedIn = false;
+      let poolNodes = [];
+      let poolThreshold = 10;
+      let poolSnapshot = [];
 
       function render(obj) {
         $("raw").textContent = JSON.stringify(obj, null, 2);
@@ -209,11 +296,18 @@
       }
 
       async function cmd(payload) {
-        const res = await fetch("/api/control", {
-          method: "POST",
-          headers: { "content-type": "application/json", authorization: "Bearer " + token },
-          body: JSON.stringify(payload),
-        });
+        let res;
+        try {
+          res = await fetch("/api/control", {
+            method: "POST",
+            headers: { "content-type": "application/json", authorization: "Bearer " + token },
+            body: JSON.stringify(payload),
+          });
+        } catch (err) {
+          // Server down / restarting — surface it instead of silently dead buttons.
+          setConn("bad", "server unreachable");
+          return { ok: false, error: "server unreachable (is zcode-proxy running?)" };
+        }
         let body;
         try {
           body = await res.json();
@@ -240,6 +334,28 @@
         return Number.isNaN(date.getTime()) ? String(value) : date.toLocaleString();
       }
 
+      /** Compact human unit (100M / 3M / 12k); the exact value rides along in the title. */
+      function fmtN(n) {
+        if (typeof n !== "number" || !isFinite(n)) return "—";
+        const a = Math.abs(n);
+        const trim = (s) => s.replace(/\.0$/, "");
+        if (a >= 1e9) return trim((n / 1e9).toFixed(a >= 1e10 ? 0 : 1)) + "B";
+        if (a >= 1e6) return trim((n / 1e6).toFixed(a >= 1e7 ? 0 : 1)) + "M";
+        if (a >= 1e4) return Math.round(n / 1e3) + "k";
+        return n.toLocaleString();
+      }
+
+      /** Bar fill class by remaining share. */
+      function barClass(frac) {
+        return frac >= 0.5 ? "ok" : frac >= 0.2 ? "warn" : "bad";
+      }
+
+      function chip(id, label, value) {
+        $(id).innerHTML = esc(label) + " <b>" + esc(value) + "</b>";
+      }
+
+      let statusCache = null;
+
       async function refreshStatus() {
         if (!token) return;
         const r = await cmd({ cmd: "status" });
@@ -249,66 +365,127 @@
         }
         setConn("ok", "connected");
         loggedIn = !!r.loggedIn;
-        $("s-provider").textContent = r.provider;
-        $("s-plan").textContent = r.plan;
-        $("s-port").textContent = r.proxyPort ? "listening on " + r.proxyPort : "stopped";
-        $("s-login").textContent = r.loggedIn ? "yes" : "no — use Login below";
-        $("s-login").className = r.loggedIn ? "" : "danger";
-        $("cfg-provider").value = r.provider;
-        $("cfg-plan").value = r.plan;
+        statusCache = r;
+        chip("c-proxy", "proxy", r.proxyPort ? "listening :" + r.proxyPort : "stopped");
+        chip("c-default", "defaults", r.provider + " · " + r.plan);
         $("start").disabled = !!r.proxyPort;
         $("stop").disabled = !r.proxyPort;
+        renderOauthStatus(r.oauth);
+        renderSettingsSummary();
       }
 
-      function renderQuota(snap) {
+      /** Live OAuth flow feedback: waiting / completed / failed (from `status`). */
+      function renderOauthStatus(o) {
+        const box = $("oauth-status");
+        if (!o) {
+          box.innerHTML = "";
+          return;
+        }
+        const when = fmtTs(o.finishedAt ?? o.startedAt);
+        if (o.state === "pending") {
+          box.innerHTML =
+            '<span class="muted">⏳ ' + esc(o.provider) + " login waiting for browser authorization… (started " +
+            esc(new Date(o.startedAt).toLocaleTimeString()) + ", times out after 5 min)</span>";
+        } else if (o.state === "completed") {
+          box.innerHTML =
+            '<span class="ok-text">✓ ' + esc(o.provider) + " login completed — account pooled (" + esc(when) + ")</span>";
+        } else {
+          box.innerHTML =
+            '<span class="danger">✗ ' + esc(o.provider) + " login failed (" + esc(when) + "): " + esc(o.error || "unknown error") + "</span>";
+        }
+      }
+
+      function renderSettingsSummary() {
+        const r = statusCache;
+        if (!r) return;
+        const oauth = poolSnapshot.filter((e) => e.source === "oauth").length;
+        const config = poolSnapshot.filter((e) => e.source === "config").length;
+        const rows = [
+          ["Proxy listen", r.proxyPort ? "http://0.0.0.0:" + r.proxyPort + " (auth key required)" : "stopped"],
+          ["Account pool", poolSnapshot.length + " account(s) — " + oauth + " oauth login" + (oauth === 1 ? "" : "s") + ", " + config + " config key" + (config === 1 ? "" : "s")],
+          ["Cooldown threshold", poolSnapshot.length ? poolThreshold + " consecutive key errors (429/401/403) per account" : "—"],
+          ["Exit nodes", poolNodes.length ? poolNodes.length + " (managed mihomo, one local listener per node)" : "none — accounts connect directly"],
+          ["Login store", loggedIn ? "credential present" : "empty"],
+        ];
+        $("cfg-summary").innerHTML = rows
+          .map(([k, v]) => "<dt>" + esc(k) + "</dt><dd>" + esc(v) + "</dd>")
+          .join("");
+      }
+
+      /** Balance/limit rows for one snapshot slice (whole snapshot, or one pool account). */
+      function quotaRows(snap) {
         const parts = [];
         for (const b of snap.balances || []) {
           const remaining = b.remainingUnits;
           const total = b.totalUnits;
           const pct = total ? Math.min(100, Math.max(0, (remaining / total) * 100)) : null;
           parts.push(
-            '<div class="row"><strong>' + esc(b.showName) + "</strong> <span class=\"muted\">" +
-            esc(remaining) + " / " + esc(total) + " " + esc(b.unitType || "") +
-            (b.expiresAt ? " · expires " + esc(fmtTs(b.expiresAt)) : "") +
-            "</span></div>" +
-            (pct === null ? "" : '<div class="bar"><i style="width:' + pct.toFixed(1) + '%"></i></div>'),
+            '<div class="qrow">' +
+            '<span class="qname" title="' + esc(b.showName) + '">' + esc(b.showName) + "</span>" +
+            '<span class="qnum" title="' + esc(remaining) + " / " + esc(total) + '">' +
+            fmtN(remaining) + " / " + fmtN(total) + " " + esc(b.unitType || "") + "</span>" +
+            (pct === null ? "<span></span>" : '<span class="bar"><i class="' + barClass(pct / 100) + '" style="width:' + pct.toFixed(1) + '%"></i></span>') +
+            (b.expiresAt ? '<span class="qexp">expires ' + esc(fmtTs(b.expiresAt)) + "</span>" : "") +
+            "</div>",
           );
         }
         const plan = snap.codingPlan;
         if (plan) {
-          parts.push('<div class="row"><strong>' + esc(plan.level || "coding plan") + "</strong></div>");
           for (const limit of plan.limits || []) {
             // Upstream `number` is NOT a comparable total (live TIME_LIMIT row:
             // remaining=3894, number=1), so like the CLI/TUI this shows remaining
             // alone. `percentage` is the one self-consistent signal: when present
             // it is a used share (0-100), and the bar is the remaining share
-            // derived from it — never an X/Y fabrication. Direction is not
-            // re-labelled here because upstream owns its meaning.
+            // derived from it — never an X/Y fabrication.
             const remaining = limit.remaining;
             const pct = limit.percentage;
             const remainingFrac =
               typeof pct === "number" && isFinite(pct) && pct >= 0 && pct <= 100 ? 1 - pct / 100 : null;
             parts.push(
-              '<div class="row"><span class="muted">' + esc(limit.type) + "</span> <strong>" +
+              '<div class="qrow">' +
+              '<span class="qname" title="coding-plan ' + esc(limit.type) + '">' + esc(limit.type) + "</span>" +
+              '<span class="qnum" title="' + esc(remaining ?? "—") + '">' +
               (typeof remaining === "number"
-                ? esc(remaining.toLocaleString()) + (limit.unit ? " " + esc(limit.unit) : "") + " remaining"
-                : "unavailable") +
-              "</strong>" +
-              (limit.nextResetTime ? ' <span class="muted">· resets ' + esc(fmtTs(limit.nextResetTime)) + "</span>" : "") +
-              "</div>" +
+                ? fmtN(remaining) + (limit.unit ? " " + esc(limit.unit) : "") + " left"
+                : "unavailable") + "</span>" +
               (remainingFrac === null
-                ? ""
-                : '<div class="bar"><i style="width:' + (remainingFrac * 100).toFixed(1) + '%"></i></div>'),
+                ? "<span></span>"
+                : '<span class="bar"><i class="' + barClass(remainingFrac) + '" style="width:' + (remainingFrac * 100).toFixed(1) + '%"></i></span>') +
+              (limit.nextResetTime ? '<span class="qexp">resets ' + esc(fmtTs(limit.nextResetTime)) + "</span>" : "") +
+              "</div>",
             );
           }
-        } else {
-          parts.push('<div class="muted">No coding-plan window for this account.</div>');
+        } else if (!(snap.balances || []).length) {
+          parts.push('<div class="muted" style="font-size:12px">No usage window reported for this account.</div>');
         }
         for (const err of snap.errors || []) {
-          parts.push('<div class="danger">' + esc(err) + "</div>");
+          parts.push('<div class="err">' + esc(err) + "</div>");
         }
         if (snap.jwt) {
-          parts.push('<div class="muted">credential age: ' + esc(snap.jwt.ageHours.toFixed(1)) + " h</div>");
+          parts.push('<div class="muted" style="font-size:11px">credential age: ' + esc(snap.jwt.ageHours.toFixed(1)) + " h</div>");
+        }
+        return parts;
+      }
+
+      function renderQuota(snap) {
+        let parts;
+        if (snap.accounts && snap.accounts.length) {
+          // Pool mode: one section per account (the top-level fields are aggregates).
+          parts = [];
+          for (const a of snap.accounts) {
+            parts.push(
+              '<div class="qa"><div class="qa-head">' +
+              '<span class="name">' + esc(a.label) + "</span>" +
+              '<span class="badge">' + esc(a.provider) + "</span>" +
+              '<span class="badge">' + esc(a.plan || "coding-plan") + "</span>" +
+              (a.codingPlan && a.codingPlan.level ? '<span class="badge accent">' + esc(a.codingPlan.level) + "</span>" : "") +
+              "</div>",
+            );
+            parts = parts.concat(quotaRows(a));
+            parts.push("</div>");
+          }
+        } else {
+          parts = quotaRows(snap);
         }
         $("quota-body").innerHTML = parts.join("") || "Empty snapshot.";
       }
@@ -328,8 +505,102 @@
           $("quota-age").textContent = "updated " + new Date().toLocaleTimeString();
         } else {
           $("quota-age").textContent = "";
-          $("quota-body").innerHTML = '<div class="danger">' + esc(r.error || "failed") + "</div>";
+          $("quota-body").innerHTML = '<div class="err">' + esc(r.error || "failed") + "</div>";
         }
+      }
+
+      function accountRow(e) {
+        const editable = e.source === "oauth";
+        const state = e.cooling
+          ? '<span class="badge bad">cooling</span>'
+          : e.current
+            ? '<span class="badge accent">active</span>'
+            : '<span class="badge">ready</span>';
+        const strikes = e.strikes
+          ? '<span class="strike">' + e.strikes + "/" + poolThreshold + " strikes</span>"
+          : "";
+        const nodeTitle = e.proxyUrl ? esc(e.proxyUrl) : "direct connection";
+        const nodeOptions =
+          '<option value=""' + (e.proxy ? "" : " selected") + ">auto</option>" +
+          poolNodes
+            .map((n) => '<option value="' + esc(n) + '"' + (e.proxy === n ? " selected" : "") + ">" + esc(n) + "</option>")
+            .join("");
+        const planSel =
+          '<label>plan</label> <select class="compact" data-plan="' + esc(e.id) + '"' + (editable ? "" : " disabled title=\"set plan in config.yaml (pool.accounts)\"") + ">" +
+          '<option value="coding-plan"' + (e.plan === "coding-plan" ? " selected" : "") + ">coding</option>" +
+          '<option value="start-plan"' + (e.plan === "start-plan" ? " selected" : "") + ">start</option>" +
+          "</select>";
+        const nodeSel = poolNodes.length
+          ? '<label>exit</label> <select class="compact" data-node="' + esc(e.id) + '" title="' + nodeTitle + '"' + (editable ? "" : " disabled") + ">" + nodeOptions + "</select>"
+          : '<span class="badge">' + (e.proxyLabel ? esc(e.proxyLabel) : "direct") + "</span>";
+        const remove = editable
+          ? '<button class="ghost compact" data-remove="' + esc(e.id) + '" title="remove this stored login">✕</button>'
+          : "";
+        return (
+          '<div class="acc">' +
+          '<span class="mark">' + (e.current ? "▶" : "·") + "</span>" +
+          '<span class="who"><span class="name">' + esc(e.label) + "</span>" +
+          '<span class="meta"><span class="badge">' + esc(e.provider) + "</span>" +
+          '<span class="badge">' + esc(e.source === "config" ? "config key" : "oauth login") + "</span>" +
+          state + strikes +
+          (e.proxyLabel ? ' <span class="muted" style="font-size:11px" title="' + nodeTitle + '">via ' + esc(e.proxyLabel) + "</span>" : ' <span class="muted" style="font-size:11px">direct</span>') +
+          "</span></span>" +
+          '<span class="controls">' + planSel + nodeSel + remove + "</span>" +
+          "</div>"
+        );
+      }
+
+      /** Account-pool card: rotation state, per-account plan/node editors, oauth remove. */
+      async function loadPool(force) {
+        if (!token) return;
+        // Skip re-render while the user is interacting with a per-account control.
+        if (!force && document.activeElement && $("pool-body").contains(document.activeElement)) return;
+        const r = await cmd({ cmd: "poolStatus" });
+        const box = $("pool-body");
+        if (!r.ok) {
+          box.innerHTML = '<div class="err">' + esc(r.error || "failed") + "</div>";
+          return;
+        }
+        poolNodes = r.nodes || [];
+        poolThreshold = r.threshold || 10;
+        poolSnapshot = r.pool || [];
+        const cooling = poolSnapshot.filter((e) => e.cooling).length;
+        chip("c-pool", "accounts", poolSnapshot.length ? poolSnapshot.length + (cooling ? " · " + cooling + " cooling" : " ok") : "0");
+        chip("c-exit", "exit nodes", poolNodes.length || "direct");
+        renderSettingsSummary();
+        if (!poolSnapshot.length) {
+          box.innerHTML = '<span class="muted">Pool is empty — log in below or add <code>pool.accounts</code> in config.yaml.</span>';
+          return;
+        }
+        box.innerHTML = poolSnapshot.map(accountRow).join("");
+        box.querySelectorAll("[data-remove]").forEach((btn) => {
+          btn.onclick = async () => {
+            if (!confirm("Remove this stored login from the account pool?")) return;
+            await cmd({ cmd: "removeAccount", id: btn.getAttribute("data-remove") });
+            await loadPool(true);
+            await refreshStatus();
+          };
+        });
+        box.querySelectorAll("[data-plan]").forEach((sel) => {
+          sel.onchange = async () => {
+            const id = sel.getAttribute("data-plan");
+            const res = await cmd({ cmd: "updateAccount", id, plan: sel.value });
+            if (!res.ok) {
+              $("login-body").innerHTML = '<span class="err">' + esc(res.error) + "</span>";
+              await loadPool(true);
+            }
+          };
+        });
+        box.querySelectorAll("[data-node]").forEach((sel) => {
+          sel.onchange = async () => {
+            const id = sel.getAttribute("data-node");
+            const res = await cmd({ cmd: "updateAccount", id, proxy: sel.value });
+            if (!res.ok) {
+              $("login-body").innerHTML = '<span class="err">' + esc(res.error) + "</span>";
+            }
+            await loadPool(true);
+          };
+        });
       }
 
       async function pollLogs() {
@@ -357,22 +628,16 @@
         $("login-body").innerHTML =
           'Open this URL on any device: <a href="' + esc(r.authorizeUrl) + '" target="_blank" rel="noreferrer">' +
           esc(r.authorizeUrl) + "</a>";
-        // The server finishes the flow by itself (polling login, no local
-        // callback needed), so poll briefly to flip the status card.
-        let tries = 0;
-        const timer = setInterval(async () => {
-          tries += 1;
-          await refreshStatus();
-          if (loggedIn || tries >= 100) clearInterval(timer);
-        }, 3000);
+        // Completion feedback is driven by `status.oauth` (renderOauthStatus);
+        // the pool card picks the new account up via the disk-sync poll.
       }
 
       async function guard(label, payload) {
         if (!token) return;
         const r = await cmd(payload);
-        if (!r.ok) $("cfg-note").textContent = label + ": " + r.error;
-        else $("cfg-note").textContent = label + ": ok";
+        $("action-note").textContent = r.ok ? label + ": ok" : label + ": " + r.error;
         await refreshStatus();
+        await loadPool(true);
       }
 
       $("connect").onclick = async () => {
@@ -381,18 +646,20 @@
         logCursor = 0;
         $("logs").textContent = "";
         await refreshStatus();
+        await loadPool(true);
       };
-      $("refresh").onclick = () => refreshStatus();
+      $("refresh").onclick = async () => {
+        await refreshStatus();
+        await loadPool();
+      };
       $("quota").onclick = () => loadQuota();
       $("start").onclick = () => guard("start", { cmd: "startProxy" });
       $("stop").onclick = () => guard("stop", { cmd: "stopProxy" });
-      $("apply").onclick = () =>
-        guard("apply", { cmd: "setConfig", provider: $("cfg-provider").value, plan: $("cfg-plan").value });
       $("login").onclick = () => startLogin("zai");
       $("login-bm").onclick = () => startLogin("bigmodel");
       $("logout").onclick = () => {
         if (
-          confirm("Log out and delete the stored credential? The proxy stops using it immediately and is stopped if it is running.")
+          confirm("Log out and delete ALL stored logins? Config-key accounts in config.yaml are kept. The proxy stops if it is running.")
         )
           guard("logout", { cmd: "logout" });
       };
@@ -401,11 +668,13 @@
       if (token) {
         $("token").value = token;
         refreshStatus();
+        loadPool(true);
         loadQuota();
       } else {
         setConn("bad", "enter token to connect");
       }
       setInterval(refreshStatus, 5000);
+      setInterval(() => loadPool(), 5000);
       setInterval(pollLogs, 2000);
       // No quota polling timer on purpose: the billing gateway rate-limits
       // frequent queries (same reason the TUI refreshes on keypress only).

@@ -163,12 +163,14 @@ async:
 # Env overrides: ZCODE_CLAIM_ENABLED, ZCODE_CLAIM_AUTO, ZCODE_CLAIM_ORIGIN,
 # ZCODE_CLAIM_POLL_INTERVAL_MS.
 claim:
-  # On by default: the scheduler polls the preview endpoint every 5 min and
-  # idles until a campaign goes live (404 preview = nothing to claim).
-  # `false` = CLI-only (`zcode-proxy claim [list|now]` still works).
+  # On by default: the scheduler polls the preview endpoint and idles until
+  # a campaign goes live (404 preview = nothing to claim). `false` = CLI-only
+  # (`zcode-proxy claim [list|now]` still works).
   enabled: true
-  # Auto-claim in the background while serving. `false` = CLI-only
-  # (`zcode-proxy claim` still works when `enabled: true`).
+  # Auto-claim in the background while serving — ONE scheduler PER pool
+  # account with a JWT, each through that account's exit proxy; every account
+  # gets a claim attempt at startup, then every pollIntervalMs. `false` =
+  # CLI-only (`zcode-proxy claim` still works when `enabled: true`).
   auto: true
   origin: "https://zcode.z.ai"
   # Preview poll cadence (5 min default).
@@ -199,6 +201,67 @@ endpointRouting:
 clientSigning:
   enabled: true
   origin: "https://zcode.z.ai"
+
+# Account pool — sequential rotation with cooldown (NOT load balancing).
+# Sources merge at startup: the plaintext accounts below + every OAuth login
+# (`auth login <zai|bigmodel>` accumulates accounts instead of overwriting).
+# The pool always uses the CURRENT account until it breaks: upstream key
+# errors (429/401/403) count as strikes; after `failureThreshold` CONSECUTIVE
+# strikes the account cools down and the next one takes over. When every
+# account is cooling, all of them revive and rotation restarts from the top.
+# Other errors (5xx, network) never count — one shared outage won't burn the pool.
+# accounts without `secret` → bigmodel-style key; Z.AI keys use the
+# `{apiKey}.{secret}` form (fill both fields). Config accounts always run
+# coding-plan endpoints even when the global plan is start-plan.
+pool:
+  # Consecutive key-class upstream errors (429/401/403) before an account
+  # cools down and rotation moves on. 5xx/network errors never count.
+  failureThreshold: 10
+  # Manual api-key accounts, mixed providers allowed. OAuth logins (auth login)
+  # accumulate in the encrypted store and join the same pool automatically.
+  # Per-account plan / exit-node pinning is optional (oauth logins can also be
+  # edited live in the web panel — provider is inherent to the key):
+  #   plan:  coding-plan (default) | start-plan   (start-plan needs a plan JWT)
+  #   proxy: exact proxyPool.mihomo.nodes[].name to pin this account's exit;
+  #          default is round-robin (account i -> node i mod n)
+  accounts: []
+  # - label: bm-1
+  #   provider: bigmodel
+  #   apiKey: "your-bigmodel-key"
+  # - label: zai-1
+  #   provider: zai
+  #   apiKey: "your-zai-key-id"
+  #   secret: "your-zai-key-secret"
+  #   proxy: node-jp
+
+# Managed mihomo proxy pool — gives each account its own stable outbound IP
+# (anti IP-risk-control). zcode-proxy generates a mihomo config (one local
+# mixed HTTP+SOCKS listener per node, each pinned to its node), spawns the
+# mihomo process, watches it, and binds account i → node (i mod n).
+# Install mihomo (https://github.com/MetaCubeX/mihomo/releases) and either put
+# it on PATH or point `binary` at it. If it can't start, accounts run DIRECT
+# with a loud warning — the proxy itself is unaffected.
+proxyPool:
+  enabled: false
+  mihomo:
+    # binary: "C:/tools/mihomo/mihomo.exe"   # default: resolve `mihomo` from PATH
+    listenBasePort: 47000
+    # Clash-format `proxies` entries, passed through verbatim — paste the node
+    # mappings from your existing clash/mihomo config here (max 64):
+    nodes: []
+    # - name: node-jp
+    #   type: ss
+    #   server: jp.example.com
+    #   port: 8388
+    #   cipher: aes-256-gcm
+    #   password: "..."
+    # - name: node-sg
+    #   type: vmess
+    #   server: sg.example.com
+    #   port: 443
+    #   uuid: "..."
+    #   alterId: 0
+    #   cipher: auto
 
 logging:
   level: info

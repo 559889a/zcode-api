@@ -21,6 +21,7 @@ import { loadCredential } from "../auth/store.js";
 import { buildIdentityHeaders, normalizePrintableHeaderValue } from "../proxy/identity.js";
 import { inspectJwt } from "../auth/jwt-age.js";
 import { credentialString, type Credential } from "../auth/types.js";
+import type { PoolEntry } from "../pool/pool.js";
 import type { ProxyConfig } from "../config/types.js";
 import { errorResponse } from "../proxy/handler.js";
 
@@ -82,6 +83,27 @@ export interface QuotaSnapshot {
    */
   codingPlan: QuotaCodingPlan | null;
   errors: string[];
+  /**
+   * Per-account section — present only when the caller supplied pool entries.
+   * The legacy top-level fields above aggregate the accounts for backward
+   * compatibility with the existing panel/TUI renderers.
+   */
+  accounts?: AccountQuota[];
+}
+
+/** Quota of one pool account (config api-key or OAuth login). */
+export interface AccountQuota {
+  label: string;
+  provider: string;
+  source: "config" | "oauth";
+  /** Resolved plan tier of this account (display). */
+  plan: string;
+  codingPlan: QuotaCodingPlan | null;
+  balances: QuotaBalanceEntry[];
+  claimablePlans: QuotaPlanEntry[];
+  errors: string[];
+  /** Billing envelope server_time when the credits plane answered. */
+  serverTime?: number;
 }
 
 /** Query one billing/monitor URL, tolerating per-endpoint failures. */
@@ -90,9 +112,13 @@ async function fetchBilling(
   path: string,
   headers: Record<string, string>,
   fetchImpl: typeof fetch,
+  proxyUrl?: string,
 ): Promise<{ code?: number; msg?: string; data?: unknown; success?: unknown } | null> {
   try {
-    const resp = await fetchImpl(`${origin.replace(/\/+$/, "")}${path}`, { headers });
+    const init: RequestInit & { proxy?: string } = { headers };
+    // Bun fetch per-request proxy — same seam the LLM hot path uses.
+    if (proxyUrl) init.proxy = proxyUrl;
+    const resp = await fetchImpl(`${origin.replace(/\/+$/, "")}${path}`, init);
     const text = await resp.text();
     try {
       return JSON.parse(text) as { code?: number; msg?: string; data?: unknown; success?: unknown };
@@ -145,26 +171,136 @@ function toFiniteNumber(v: unknown): number | undefined {
   return Number.isFinite(n) ? n : undefined;
 }
 
-/** Build the quota snapshot. Exported for tests. `loadCredentialImpl` is injectable for tests. */
+/** Parse balance windows from a billing/balance envelope `data`. */
+function parseBalances(data: { balances?: any[] }): QuotaBalanceEntry[] {
+  const balances: QuotaBalanceEntry[] = [];
+  for (const b of Array.isArray(data.balances) ? data.balances : []) {
+    // unitType/expiresAt camelCase aliases observed live alongside snake_case;
+    // accept both so neither casing drops the field.
+    const expiresAt = toFiniteNumber(b.expires_at ?? b.expiresAt);
+    const unitType = b.unit_type ?? b.unitType;
+    balances.push({
+      showName: String(b.show_name ?? ""),
+      remainingUnits: toFiniteNumber(b.remaining_units ?? b.remainingUnits) ?? 0,
+      totalUnits: toFiniteNumber(b.total_units ?? b.totalUnits) ?? 0,
+      usedUnits: toFiniteNumber(b.used_units ?? b.usedUnits) ?? 0,
+      ...(unitType ? { unitType: String(unitType) } : {}),
+      ...(expiresAt !== undefined ? { expiresAt } : {}),
+    });
+  }
+  return balances;
+}
+
+/** Parse claimable trial plans from a billing/preview envelope `data`. */
+function parseClaimablePlans(data: { plans?: any[] }): QuotaPlanEntry[] {
+  const plans: QuotaPlanEntry[] = [];
+  for (const p of Array.isArray(data.plans) ? data.plans : []) {
+    plans.push({
+      planId: String(p.plan_id ?? ""),
+      name: String(p.name ?? p.plan_id ?? ""),
+      ...(p.description ? { description: String(p.description) } : {}),
+      entitlements: (Array.isArray(p.entitlements) ? p.entitlements : []).map((e: any) => ({
+        showName: String(e.show_name ?? ""),
+        grantUnits: toFiniteNumber(e.grant_units ?? e.grantUnits) ?? 0,
+        unitType: String(e.unit_type ?? e.unitType ?? "token"),
+        ...(toFiniteNumber(e.effective_at ?? e.effectiveAt) !== undefined
+          ? { effectiveAt: toFiniteNumber(e.effective_at ?? e.effectiveAt) as number }
+          : {}),
+      })),
+    });
+  }
+  return plans;
+}
+
+/** Coding monitor plane for one credential; failures land in `errors` (or silently for an unusable origin). */
+async function fetchCodingPlan(
+  config: ProxyConfig,
+  cred: Credential,
+  fetchImpl: typeof fetch,
+  proxyUrl: string | undefined,
+  errors: string[],
+): Promise<QuotaCodingPlan | null> {
+  const cOrigin = codingOrigin(config, cred.provider);
+  if (!cOrigin) return null;
+  // Coding plane: same contract the official usage panel uses for individual
+  // coding plans (`authorization` = the raw API key, personal scope — no team
+  // headers, no `?type=2`). Failures degrade to null like the official
+  // `fetchQuota().catch(() => null)`, never killing the credits data.
+  const cEnvelope = await fetchBilling(cOrigin, "/api/monitor/usage/quota/limit", {
+    authorization: credentialString(cred),
+    accept: "application/json",
+  }, fetchImpl, proxyUrl);
+  if (cEnvelope && isSuccessfulEnvelope(cEnvelope)) {
+    const d = (cEnvelope.data ?? {}) as { level?: unknown; limits?: unknown };
+    return {
+      level: typeof d.level === "string" && d.level.trim() !== "" ? d.level.trim() : null,
+      limits: (Array.isArray(d.limits) ? d.limits : []).map(parseCodingLimit).filter((l): l is QuotaCodingLimit => l !== null),
+    };
+  }
+  errors.push(`coding: ${cEnvelope ? `${cEnvelope.code} ${cEnvelope.msg ?? ""}`.trim() : "request failed"}`);
+  return null;
+}
+
+/** Quota snapshot of ONE pool account (config api-key or OAuth login). */
+async function snapshotOneAccount(
+  config: ProxyConfig,
+  entry: PoolEntry,
+  idHeaders: Record<string, string>,
+  platform: string,
+  fetchImpl: typeof fetch,
+): Promise<AccountQuota> {
+  const cred = entry.credential;
+  const appVersion = config.identity.appVersion;
+  const origin = config.claim.origin || "https://zcode.z.ai";
+  const errors: string[] = [];
+  const balances: QuotaBalanceEntry[] = [];
+  const claimablePlans: QuotaPlanEntry[] = [];
+  let serverTime: number | undefined;
+
+  // Credits plane needs the plan JWT; a config api-key account without one
+  // still gets its monitor-plane limits below instead of a dead snapshot.
+  if (cred.jwt) {
+    const headers = { ...idHeaders, authorization: `Bearer ${cred.jwt}`, Accept: "application/json" };
+    const [balance, preview] = await Promise.all([
+      fetchBilling(origin, `/api/v1/zcode-plan/billing/balance?app_version=${encodeURIComponent(appVersion)}&platform=${encodeURIComponent(platform)}`, headers, fetchImpl, entry.proxyUrl),
+      fetchBilling(origin, `/api/v1/zcode-plan/billing/preview?app_version=${encodeURIComponent(appVersion)}&platform=${encodeURIComponent(platform)}`, headers, fetchImpl, entry.proxyUrl),
+    ]);
+    if (balance && !isSuccessfulEnvelope(balance)) errors.push(`balance: ${balance.code} ${balance.msg ?? ""}`.trim());
+    if (preview && !isSuccessfulEnvelope(preview)) errors.push(`preview: ${preview.code} ${preview.msg ?? ""}`.trim());
+    const balanceData = (balance?.data ?? {}) as { balances?: any[]; server_time?: number };
+    balances.push(...parseBalances(balanceData));
+    serverTime = toFiniteNumber(balanceData.server_time) ?? undefined;
+    claimablePlans.push(...parseClaimablePlans((preview?.data ?? {}) as { plans?: any[] }));
+  } else {
+    errors.push("balance: no plan JWT — credits plane unavailable (re-login to capture it)");
+  }
+
+  const codingPlan = await fetchCodingPlan(config, cred, fetchImpl, entry.proxyUrl, errors);
+  return {
+    label: entry.label,
+    provider: entry.provider,
+    source: entry.source,
+    plan: entry.plan,
+    codingPlan,
+    balances,
+    claimablePlans,
+    errors,
+    ...(serverTime !== undefined ? { serverTime } : {}),
+  };
+}
+
+/** Build the quota snapshot. Exported for tests. `loadCredentialImpl` is injectable for tests; `poolEntries` switches to per-account mode. */
 export async function collectQuotaSnapshot(
   config: ProxyConfig,
   fetchImpl: typeof fetch = fetch,
   loadCredentialImpl: typeof loadCredential = loadCredential,
+  poolEntries?: PoolEntry[],
 ): Promise<QuotaSnapshot> {
-  const cred = await loadCredentialImpl();
-  if (!cred) {
-    throw new Error("not logged in (run: zcode-proxy auth login)");
-  }
-  const jwtInfo = cred.jwt ? inspectJwt(cred.jwt) : null;
-  const jwt = jwtInfo
-    ? { ageHours: Number(jwtInfo.ageHours.toFixed(2)), issuedAt: jwtInfo.iat }
-    : null;
   const identity = config.identity;
   const idHeaders = buildIdentityHeaders(identity);
   // The claim client drops X-ZCode-Agent for zcode.z.ai control-plane calls;
   // the billing gateway follows the same precedent.
   delete idHeaders["X-ZCode-Agent"];
-  const headers: Record<string, string> = { ...idHeaders, authorization: `Bearer ${cred.jwt}`, Accept: "application/json" };
   // Billing fingerprint is reconstructed from the observed claim-client format
   // (`${platform}-${arch}`). Reuses identity.ts's env-override normalization
   // (same ZCODE_IDENTITY_PLATFORM/ARCH overrides the proxy headers use —
@@ -173,6 +309,33 @@ export async function collectQuotaSnapshot(
   // `-x64`/`linux-`.
   // NOTE: ProxyIdentity has no platform/arch fields — do not read them off `identity`.
   const platform = `${normalizePrintableHeaderValue(process.env.ZCODE_IDENTITY_PLATFORM) ?? process.platform}-${normalizePrintableHeaderValue(process.env.ZCODE_IDENTITY_ARCH) ?? os.arch()}`;
+
+  // Pool mode: one snapshot per account, each queried through its own bound proxy.
+  if (poolEntries && poolEntries.length > 0) {
+    const accounts = await Promise.all(poolEntries.map((e) => snapshotOneAccount(config, e, idHeaders, platform, fetchImpl)));
+    const jwtRaw = poolEntries.find((e) => e.credential.jwt)?.credential.jwt;
+    const jwtInfo = jwtRaw ? inspectJwt(jwtRaw) : null;
+    return {
+      provider: config.provider,
+      serverTime: accounts.find((a) => a.serverTime !== undefined)?.serverTime ?? Math.floor(Date.now() / 1000),
+      jwt: jwtInfo ? { ageHours: Number(jwtInfo.ageHours.toFixed(2)), issuedAt: jwtInfo.iat } : null,
+      balances: accounts.flatMap((a) => a.balances),
+      claimablePlans: accounts.find((a) => a.claimablePlans.length > 0)?.claimablePlans ?? [],
+      codingPlan: accounts.find((a) => a.codingPlan !== null)?.codingPlan ?? null,
+      errors: accounts.flatMap((a) => a.errors.map((e) => `${a.label}: ${e}`)),
+      accounts,
+    };
+  }
+
+  const cred = await loadCredentialImpl();
+  if (!cred) {
+    throw new Error("not logged in (run: zcode-proxy auth login)");
+  }
+  const jwtInfo = cred.jwt ? inspectJwt(cred.jwt) : null;
+  const jwt = jwtInfo
+    ? { ageHours: Number(jwtInfo.ageHours.toFixed(2)), issuedAt: jwtInfo.iat }
+    : null;
+  const headers: Record<string, string> = { ...idHeaders, authorization: `Bearer ${cred.jwt}`, Accept: "application/json" };
   const origin = config.claim.origin || "https://zcode.z.ai";
   const appVersion = identity.appVersion;
 
@@ -192,69 +355,15 @@ export async function collectQuotaSnapshot(
     errors.push("balance: no plan JWT — credits plane unavailable (re-login to capture it)");
   }
 
-  // Coding plane: same contract the official usage panel uses for individual
-  // coding plans (`authorization` = the raw API key, personal scope — no team
-  // headers, no `?type=2`). Failures degrade to null like the official
-  // `fetchQuota().catch(() => null)`, never killing the credits data.
-  let codingPlan: QuotaCodingPlan | null = null;
-  const cOrigin = codingOrigin(config, cred.provider);
-  if (cOrigin) {
-    const cEnvelope = await fetchBilling(cOrigin, "/api/monitor/usage/quota/limit", {
-      authorization: credentialString(cred),
-      accept: "application/json",
-    }, fetchImpl);
-    if (cEnvelope && isSuccessfulEnvelope(cEnvelope)) {
-      const d = (cEnvelope.data ?? {}) as { level?: unknown; limits?: unknown };
-      codingPlan = {
-        level: typeof d.level === "string" && d.level.trim() !== "" ? d.level.trim() : null,
-        limits: (Array.isArray(d.limits) ? d.limits : []).map(parseCodingLimit).filter((l): l is QuotaCodingLimit => l !== null),
-      };
-    } else {
-      errors.push(`coding: ${cEnvelope ? `${cEnvelope.code} ${cEnvelope.msg ?? ""}`.trim() : "request failed"}`);
-    }
-  }
-
-  const balances: QuotaBalanceEntry[] = [];
-  const balanceData = (balance?.data ?? {}) as { balances?: any[]; server_time?: number };
-  for (const b of Array.isArray(balanceData.balances) ? balanceData.balances : []) {
-    // unitType/expiresAt camelCase aliases observed live alongside snake_case;
-    // accept both so neither casing drops the field.
-    const expiresAt = toFiniteNumber(b.expires_at ?? b.expiresAt);
-    const unitType = b.unit_type ?? b.unitType;
-    balances.push({
-      showName: String(b.show_name ?? ""),
-      remainingUnits: toFiniteNumber(b.remaining_units ?? b.remainingUnits) ?? 0,
-      totalUnits: toFiniteNumber(b.total_units ?? b.totalUnits) ?? 0,
-      usedUnits: toFiniteNumber(b.used_units ?? b.usedUnits) ?? 0,
-      ...(unitType ? { unitType: String(unitType) } : {}),
-      ...(expiresAt !== undefined ? { expiresAt } : {}),
-    });
-  }
-
-  const claimablePlans: QuotaPlanEntry[] = [];
-  const previewData = (preview?.data ?? {}) as { plans?: any[] };
-  for (const p of Array.isArray(previewData.plans) ? previewData.plans : []) {
-    claimablePlans.push({
-      planId: String(p.plan_id ?? ""),
-      name: String(p.name ?? p.plan_id ?? ""),
-      ...(p.description ? { description: String(p.description) } : {}),
-      entitlements: (Array.isArray(p.entitlements) ? p.entitlements : []).map((e: any) => ({
-        showName: String(e.show_name ?? ""),
-        grantUnits: toFiniteNumber(e.grant_units ?? e.grantUnits) ?? 0,
-        unitType: String(e.unit_type ?? e.unitType ?? "token"),
-        ...(toFiniteNumber(e.effective_at ?? e.effectiveAt) !== undefined
-          ? { effectiveAt: toFiniteNumber(e.effective_at ?? e.effectiveAt) as number }
-          : {}),
-      })),
-    });
-  }
+  const codingPlan = await fetchCodingPlan(config, cred, fetchImpl, undefined, errors);
+  const balanceData = (balance?.data ?? {}) as { server_time?: number };
 
   return {
     provider: config.provider,
     serverTime: toFiniteNumber(balanceData.server_time) ?? Math.floor(Date.now() / 1000),
     jwt,
-    balances,
-    claimablePlans,
+    balances: parseBalances((balance?.data ?? {}) as { balances?: any[] }),
+    claimablePlans: parseClaimablePlans((preview?.data ?? {}) as { plans?: any[] }),
     codingPlan,
     errors,
   };
@@ -265,9 +374,10 @@ export async function handleQuota(
   config: ProxyConfig,
   fetchImpl: typeof fetch = fetch,
   loadCredentialImpl: typeof loadCredential = loadCredential,
+  poolEntries?: PoolEntry[],
 ): Promise<Response> {
   try {
-    const snapshot = await collectQuotaSnapshot(config, fetchImpl, loadCredentialImpl);
+    const snapshot = await collectQuotaSnapshot(config, fetchImpl, loadCredentialImpl, poolEntries);
     return new Response(JSON.stringify(snapshot, null, 1), {
       status: 200,
       headers: { "content-type": "application/json" },

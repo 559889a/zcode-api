@@ -8,6 +8,13 @@
  * Worker-per-solve also isolates happy-dom's global browser-frame/cookie
  * state per solve, removing cross-solve races.
  *
+ * `ZCODE_CAPTCHA_WORKER=off` switches the execution backend to a child
+ * process (fork of the same entry bundle, same protocol) for machines where
+ * worker threads crash natively mid-solve — a worker crash kills the whole
+ * process and cannot be caught, while a child's death is a catchable event
+ * that fails only that solve (the pool retries a fresh child; there is
+ * deliberately NO in-process fallback in off mode — see solveViaWorkerOrInProcess).
+ *
  * The worker entry is a build-time FILE ASSET (captcha-worker-asset.ts —
  * `bun build --compile` cannot resolve `new Worker(new URL(...))` at
  * runtime). Resolution here is dynamic and may legitimately fail: the asset
@@ -18,6 +25,7 @@
  * transitions are announced once on stderr for operators.
  */
 import { Worker } from "node:worker_threads";
+import { fork, type ChildProcess } from "node:child_process";
 
 /** Per-solve timeout: overall deadline the worker gets before termination. */
 const SOLVE_WORKER_TIMEOUT_MS = Number(process.env.CAPTCHA_SOLVE_TIMEOUT_MS || 20_000);
@@ -60,6 +68,22 @@ function noteMode(mode: string, line: string): void {
 }
 
 /**
+ * Worker escape hatch: `ZCODE_CAPTCHA_WORKER=off` swaps the execution
+ * backend from a worker_threads Worker to a child_process fork running the
+ * SAME entry bundle. For machines where worker threads crash NATIVELY
+ * mid-solve (observed on a no-AVX2 CPU, 2026-10-06): a worker crash cannot
+ * be caught — it kills the whole process — while a child's death is a
+ * catchable event, so the fork backend degrades to in-process solving
+ * instead of taking the proxy down. Evaluated per call (store.ts
+ * precedent). `ponytail:` ceiling — a fork is a full Bun process (~10× a
+ * thread's footprint) and pool lanes are concurrent, but solves are
+ * short-lived and bounded (≤3 lanes); upgrade path is a fixed Bun runtime.
+ */
+function workerDisabledByEnv(): boolean {
+  return /^(off|false|0|no|child|fork)$/i.test((process.env.ZCODE_CAPTCHA_WORKER ?? "").trim());
+}
+
+/**
  * Resolve the pre-bundled worker entry (build-time file asset). Cached
  * because a miss is permanent for the process lifetime: the bundle is a
  * build input that cannot appear while running. Never throws.
@@ -73,9 +97,9 @@ async function getWorkerEntryPath(): Promise<string | null> {
   } catch {
     entryPathCache = null;
   }
-  if (entryPathCache) {
+  if (entryPathCache && !workerDisabledByEnv()) {
     noteMode("worker", "[captcha-solver] worker-thread solving active\n");
-  } else {
+  } else if (!entryPathCache) {
     noteMode(
       "in-process",
       "[captcha-solver] worker entry unavailable — solving in-process " +
@@ -87,6 +111,9 @@ async function getWorkerEntryPath(): Promise<string | null> {
 
 /** Worker-entry unusable — the only worker failure that falls back. */
 class WorkerUnavailableError extends Error {}
+
+/** Child-process unusable (spawn failure / crash before answering) — falls back. */
+class ChildUnavailableError extends Error {}
 
 /** Load-stage failures (entry missing/unloadable); runtime crashes do NOT match. */
 function isEntryUnavailableError(err: unknown): boolean {
@@ -107,6 +134,34 @@ export async function solveViaWorkerOrInProcess(req: {
   prefix: string;
 }): Promise<string> {
   const entryPath = await getWorkerEntryPath();
+  if (workerDisabledByEnv()) {
+    // Child-process backend: same entry bundle, full process, catchable death.
+    // No in-process fallback here, deliberately: in-process solving runs
+    // captcha-happy on the MAIN thread, whose sync-XHR helper spawns its own
+    // worker_threads Worker (captcha-happy.ts syncFetchBlocking) — on the very
+    // machines that need `off`, that re-introduces the uncatchable native
+    // worker crash the switch exists to avoid (plus 12s event-loop stalls).
+    // A dead child fails the solve; the pool's retry ladder rolls a fresh one.
+    if (entryPath === null) {
+      const msg =
+        "captcha worker entry unavailable and ZCODE_CAPTCHA_WORKER=off — " +
+        "run scripts/build-fork-worker.ts / bun run build to (re)generate it " +
+        "(in-process solving is disabled by the off switch)";
+      noteMode("off-no-entry", `[captcha-solver] ${msg}\n`);
+      throw new Error(msg);
+    }
+    noteMode("child", "[captcha-solver] ZCODE_CAPTCHA_WORKER=off — solving in a child process\n");
+    try {
+      return await solveInChildProcess(entryPath, req);
+    } catch (err) {
+      if (err instanceof ChildUnavailableError) {
+        throw new Error(
+          `${err.message} (ZCODE_CAPTCHA_WORKER=off: no in-process fallback — the pool retries a fresh child)`,
+        );
+      }
+      throw err; // real solve failure (timeout / solver error) — pool retries
+    }
+  }
   if (entryPath === null) {
     return (await happy()).solveTraceless(req);
   }
@@ -183,6 +238,55 @@ function solveInWorker(
       }
     });
     worker.postMessage(msg);
+  });
+}
+
+/**
+ * One solve = one child process (fork of the same entry bundle). Semantics
+ * mirror solveInWorker — fresh execution per solve, forced kill on timeout —
+ * with one crucial difference: the child dying mid-solve is a catchable
+ * event, so a native crash degrades to in-process solving instead of
+ * killing the proxy (the no-AVX2 worker failure shape).
+ */
+function solveInChildProcess(
+  entryPath: string,
+  req: { scene: string; region: string; prefix: string },
+): Promise<string> {
+  const id = ++nextSolveId;
+  return new Promise<string>((resolve, reject) => {
+    let settled = false;
+    let child: ChildProcess | null = null;
+    const settle = (fn: () => void) => {
+      if (settled) return;
+      settled = true;
+      clearTimeout(timer);
+      try { child?.kill(); } catch {}
+      fn();
+    };
+    const timer = setTimeout(() => {
+      settle(() => reject(new Error(`captcha child process timeout (${SOLVE_WORKER_TIMEOUT_MS}ms)`)));
+    }, SOLVE_WORKER_TIMEOUT_MS);
+
+    try {
+      child = fork(entryPath);
+    } catch (err) {
+      settle(() => reject(new ChildUnavailableError(`captcha child process spawn failed: ${(err as Error).message}`)));
+      return;
+    }
+    child.on("message", (m: SolveResponse) => {
+      if (!m || m.id !== id) return;
+      if (m.ok) settle(() => resolve(m.param));
+      else settle(() => reject(new Error(m.error)));
+    });
+    child.on("error", (err: Error) => {
+      settle(() => reject(new ChildUnavailableError(`captcha child process error: ${err.message}`)));
+    });
+    child.on("exit", (code) => {
+      if (!settled) {
+        settle(() => reject(new ChildUnavailableError(`captcha child process exited (code ${code}) before responding`)));
+      }
+    });
+    child.send({ id, ...req } as SolveRequest);
   });
 }
 

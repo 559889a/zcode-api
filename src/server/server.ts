@@ -46,6 +46,7 @@ export interface ProxyServer {
 /** Create a fetch-style handler that routes the request through the proxy. */
 export function createFetchHandler(opts: ServerOptions): (req: Request) => Promise<Response> {
   const { config, auth } = opts;
+  const pool = auth.getPool();
   const proxyOpts = { config, auth, fetchImpl: opts.fetchImpl, debug: opts.debug === true };
   const responsesOpts = {
     config,
@@ -104,7 +105,7 @@ export function createFetchHandler(opts: ServerOptions): (req: Request) => Promi
     }
 
     if (path === "/quota" && method === "GET") {
-      return handleQuota(config, opts.fetchImpl);
+      return handleQuota(config, opts.fetchImpl, undefined, pool?.snapshotEntries());
     }
 
     if (path === "/v1/messages" && method === "POST") {

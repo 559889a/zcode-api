@@ -1,18 +1,31 @@
 /**
- * Auth manager — resolves the upstream credential from the OAuth login flow.
+ * Auth manager — resolves the upstream credential to inject into proxied
+ * requests.
+ *
+ * Two modes:
+ *  - Pool mode: an {@link AccountPool} is attached (any credential source
+ *    exists) — `getCredential()` returns the pool's current entry (sequential
+ *    rotation with cooldown; see pool.ts).
+ *  - Legacy single mode: one credential set via {@link setOAuthCredential},
+ *    kept for embedders/tests that never build a pool.
+ *
  * @see .omo/plans/zcode-proxy.md Task 4
  */
 import type { Credential } from "./types.js";
+import type { AccountPool } from "../pool/pool.js";
 
-/**
- * Resolves the upstream credential to inject into proxied requests.
- *
- * The credential comes from `auth login` and is injected via
- * {@link setOAuthCredential} at startup (and re-loaded on Android's
- * `startProxy` so a fresh login after restart is picked up).
- */
 export class AuthManager {
   private oauthCred: Credential | null = null;
+  private pool: AccountPool | null = null;
+
+  /** Attach (or detach) the account pool. When set and non-empty it drives `getCredential()`. */
+  setPool(pool: AccountPool | null): void {
+    this.pool = pool;
+  }
+
+  getPool(): AccountPool | null {
+    return this.pool;
+  }
 
   /**
    * Returns the current credential or throws when none is stored.
@@ -22,6 +35,9 @@ export class AuthManager {
    * below is retained for the day a flow starts filling `expiresAt`.
    */
   async getCredential(): Promise<Credential> {
+    if (this.pool && this.pool.size > 0) {
+      return this.pool.acquire().credential;
+    }
     if (this.oauthCred) {
       if (this.oauthCred.expiresAt && Date.now() >= this.oauthCred.expiresAt) {
         this.oauthCred = null;
@@ -32,9 +48,15 @@ export class AuthManager {
     throw new Error("OAuth credential not available — run: zcode-proxy auth login");
   }
 
+  /** Replace the whole oauth account list (pool mode keeps config accounts). */
+  setOAuthCredentials(creds: Credential[]): void {
+    this.oauthCred = creds[0] ?? null;
+    this.pool?.setOAuthCredentials(creds);
+  }
+
   /** Set the OAuth credential (used by the `auth login` flow). */
   setOAuthCredential(cred: Credential): void {
-    this.oauthCred = cred;
+    this.setOAuthCredentials([cred]);
   }
 
   /**
@@ -46,6 +68,6 @@ export class AuthManager {
    * requests and by auto-claim.
    */
   clearOAuthCredential(): void {
-    this.oauthCred = null;
+    this.setOAuthCredentials([]);
   }
 }

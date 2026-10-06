@@ -5,6 +5,7 @@
  */
 import type { AuthManager } from "../auth/manager.js";
 import type { ProxyConfig } from "../config/types.js";
+import type { PoolEntry } from "../pool/pool.js";
 import type { ClaimablePlan, ClaimOutcome } from "./types.js";
 import { createClaimClient, ClaimPreviewError } from "./client.js";
 import { ClaimScheduler } from "./scheduler.js";
@@ -16,39 +17,104 @@ export function claimPlatform(): string {
   return `${process.platform}-${process.arch}`;
 }
 
-export function startAutoClaim(config: ProxyConfig, auth: AuthManager): ClaimScheduler {
-  const scheduler = new ClaimScheduler({
-    // AuthManager first (fresh), then the encrypted store — on Android the
-    // login can land in the store after boot while auth hasn't been reloaded.
-    getJwt: async () => {
-      try {
-        const cred = await auth.getCredential();
-        if (cred.jwt) return cred.jwt;
-      } catch { /* fall through to the store */ }
-      const stored = await loadCredential().catch(() => null);
-      return stored?.jwt;
-    },
-    createClient: (jwt) =>
-      createClaimClient({
-        origin: config.claim.origin,
-        jwt,
-        appVersion: config.identity.appVersion,
-        platform: claimPlatform(),
-        deviceMid: config.identity.deviceMid,
-      }),
-    getCaptcha: async () => {
-      const { verifyParam, region } = await getCaptchaToken(config.identity.appVersion);
-      return { verifyParam, region: region || undefined };
-    },
-    config: {
-      planId: config.claim.planId || undefined,
-      pollIntervalMs: config.claim.pollIntervalMs,
-      cooldownMs: config.claim.cooldownMs,
-    },
-    log: (message) => console.log(`[claim] ${message}`),
-  });
-  scheduler.start();
-  return scheduler;
+/** What startAutoClaim returns: per-account scheduler fan, refreshable on membership changes. */
+export interface AutoClaimRuntime {
+  stop(): void;
+  /** Re-resolve the account list after logins/logouts/removals. Surviving accounts keep their hold state. */
+  refresh(): void;
+}
+
+/**
+ * Auto-claim for EVERY pool account with a JWT — one independent
+ * ClaimScheduler per account, so each account holds/claims on its own
+ * (before: a single scheduler pinned to the pool pointer / first stored
+ * credential, so with several OAuth accounts only one ever claimed).
+ *
+ * Per-account wiring is resolved LIVE from the pool snapshot at each tick:
+ * the JWT, the log label, and above all the account's mihomo exit proxy —
+ * claim traffic follows the same per-account exit IP as chat traffic (Bun's
+ * per-request `proxy` fetch option). `start()` ticks immediately, so every
+ * account gets a claim attempt at boot, then every `claim.pollIntervalMs`.
+ */
+export function startAutoClaim(
+  config: ProxyConfig,
+  auth: AuthManager,
+  fetchImpl?: (url: string | URL | Request, init?: RequestInit) => Promise<Response>,
+): AutoClaimRuntime {
+  const fetchBase = fetchImpl ?? globalThis.fetch;
+  const schedulers = new Map<string, ClaimScheduler>();
+  let halted = false;
+
+  const findEntry = (id: string): PoolEntry | undefined =>
+    auth.getPool()?.snapshotEntries().find((e) => e.id === id);
+
+  const refresh = (): void => {
+    if (halted) return;
+    const before = schedulers.size;
+    const live = new Map<string, PoolEntry>();
+    for (const entry of auth.getPool()?.snapshotEntries() ?? []) {
+      if (entry.credential.jwt) live.set(entry.id, entry);
+    }
+    for (const [id, scheduler] of schedulers) {
+      if (!live.has(id)) {
+        scheduler.stop();
+        schedulers.delete(id);
+      }
+    }
+    for (const id of live.keys()) {
+      if (schedulers.has(id)) continue;
+      const scheduler = new ClaimScheduler({
+        // Live lookup, NOT a captured credential: the pool may have rotated
+        // proxies or refreshed the entry since this scheduler was built.
+        getJwt: async () => findEntry(id)?.credential.jwt,
+        createClient: (jwt) =>
+          createClaimClient({
+            origin: config.claim.origin,
+            jwt,
+            appVersion: config.identity.appVersion,
+            platform: claimPlatform(),
+            deviceMid: config.identity.deviceMid,
+            fetchImpl: (url, init) => {
+              const proxy = findEntry(id)?.proxyUrl;
+              // Bun-only per-request option (same pattern as sendUpstreamRequest);
+              // harmless extra key elsewhere.
+              return fetchBase(url, (proxy ? { ...init, proxy } : init) as RequestInit & { proxy?: string });
+            },
+          }),
+        getCaptcha: async () => {
+          const { verifyParam, region } = await getCaptchaToken(config.identity.appVersion);
+          return { verifyParam, region: region || undefined };
+        },
+        config: {
+          planId: config.claim.planId || undefined,
+          pollIntervalMs: config.claim.pollIntervalMs,
+          cooldownMs: config.claim.cooldownMs,
+        },
+        log: (message) => {
+          const label = findEntry(id)?.label ?? id;
+          console.log(`[claim] ${label}: ${message.replace(/^claim: /, "")}`);
+        },
+      });
+      scheduler.start();
+      schedulers.set(id, scheduler);
+    }
+    if (schedulers.size !== before) {
+      const names = (auth.getPool()?.snapshotEntries() ?? [])
+        .filter((e) => e.credential.jwt)
+        .map((e) => e.label)
+        .join(", ");
+      console.log(`[claim] fan now covers ${schedulers.size} account(s): ${names || "(none)"}`);
+    }
+  };
+
+  const stop = (): void => {
+    halted = true;
+    for (const scheduler of schedulers.values()) scheduler.stop();
+    schedulers.clear();
+  };
+
+  refresh();
+  return { stop, refresh };
 }
 
 const FAILURE_LABELS: Record<string, string> = {

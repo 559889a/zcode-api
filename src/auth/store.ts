@@ -117,14 +117,14 @@ async function encrypt(plaintext: string): Promise<string> {
   return encryptWith(getEncryptionKey(), plaintext);
 }
 
-export async function saveCredential(cred: Credential): Promise<void> {
-  mkdirSync(dirname(storeFile()), { recursive: true });
-  const json = JSON.stringify(cred);
-  const encrypted = await encrypt(json);
-  atomicWriteStore(JSON.stringify({ encrypted }));
-}
-
-export async function loadCredential(): Promise<Credential | null> {
+/**
+ * The store file holds an AES-GCM-encrypted JSON payload:
+ *  - new format: `Credential[]` (login-store account list, append-or-replace)
+ *  - legacy format: a single `Credential` object — transparently migrated to
+ *    the list form on the first load after a login.
+ * Same file/path/encryption as before; only the plaintext shape widened.
+ */
+async function loadStoreList(): Promise<Credential[] | null> {
   if (!existsSync(storeFile())) return null;
   const raw = readFileSync(storeFile(), "utf-8");
   const parsed = JSON.parse(raw);
@@ -156,11 +156,56 @@ export async function loadCredential(): Promise<Credential | null> {
   }
 
   try {
-    return JSON.parse(json) as Credential;
+    const value = JSON.parse(json) as unknown;
+    return Array.isArray(value) ? (value as Credential[]) : [value as Credential];
   } catch (e) {
     console.warn(`Ignoring corrupted credentials at ${storeFile()}: ${(e as Error).message}`);
     return null;
   }
+}
+
+/** All stored OAuth/login credentials (account pool store side). */
+export async function loadCredentials(): Promise<Credential[]> {
+  return (await loadStoreList()) ?? [];
+}
+
+/**
+ * Append-or-replace a login credential: an existing entry with the same
+ * provider+apiKey is refreshed in place, otherwise the credential is appended.
+ * Re-logins accumulate accounts (account pool) instead of overwriting.
+ */
+export async function saveCredential(cred: Credential): Promise<void> {
+  const list = (await loadStoreList()) ?? [];
+  const idx = list.findIndex((c) => c.provider === cred.provider && c.apiKey === cred.apiKey);
+  if (idx >= 0) list[idx] = cred;
+  else list.push(cred);
+  mkdirSync(dirname(storeFile()), { recursive: true });
+  atomicWriteStore(JSON.stringify({ encrypted: await encrypt(JSON.stringify(list)) }));
+}
+
+export async function loadCredential(): Promise<Credential | null> {
+  const list = await loadStoreList();
+  return list && list.length > 0 ? list[0] : null;
+}
+
+/**
+ * Remove stored OAuth credentials. With `cred` given, only that entry is
+ * removed (account-pool removal); without, the whole store is cleared
+ * (logout-all). Deleting the last entry removes the file.
+ */
+export async function removeStoredCredential(cred?: Credential): Promise<void> {
+  if (!cred) {
+    clearCredential();
+    return;
+  }
+  const list = (await loadStoreList()) ?? [];
+  const next = list.filter((c) => !(c.provider === cred.provider && c.apiKey === cred.apiKey));
+  if (next.length === 0) {
+    clearCredential();
+    return;
+  }
+  mkdirSync(dirname(storeFile()), { recursive: true });
+  atomicWriteStore(JSON.stringify({ encrypted: await encrypt(JSON.stringify(next)) }));
 }
 
 export function clearCredential(): void {

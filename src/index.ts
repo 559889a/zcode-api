@@ -11,7 +11,9 @@ import {
   type ControlState,
 } from "./control.js";
 import { collectQuotaSnapshot } from "./server/routes-quota.js";
-import { loadCredential, saveCredential, clearCredential, getStorePath } from "./auth/store.js";
+import { loadCredential, loadCredentials, saveCredential, clearCredential, removeStoredCredential, getStorePath } from "./auth/store.js";
+import { buildAccountPool, type PoolStatusEntry } from "./pool/pool.js";
+import { startMihomoPool, type MihomoRuntime } from "./pool/mihomo.js";
 import { ZaiOAuthClient, BigmodelOAuthClient, BigmodelPollOAuthClient, LOGIN_TIMEOUT_MS, parsePastedCallbackUrl, type OAuthResult } from "./auth/oauth.js";
 import { KeyResolver } from "./auth/resolver.js";
 import type { Credential } from "./auth/types.js";
@@ -102,6 +104,8 @@ function dispatchCli(args: string[]): void {
 
   if (cmd === "auth") {
     authCommand(args.slice(1));
+  } else if (cmd === "pool") {
+    void poolCommand(args.slice(1));
   } else if (cmd === "claim") {
     void claimCommand(args.slice(1));
   } else if (cmd === "quota") {
@@ -153,6 +157,7 @@ Usage:
                                     Import API key from ~/.zcode/v2/config.json
   zcode-proxy auth logout           Clear stored credentials
   zcode-proxy auth status           Show current authentication state
+  zcode-proxy pool list             Show account-pool entries and proxy bindings
   zcode-proxy claim [list|now]      List / claim weekend-plan trial packages
   zcode-proxy quota                 Show plan quota (per-model remaining/total)
   zcode-proxy version               Show version
@@ -211,32 +216,39 @@ async function startServePanel(
     auth: AuthManager;
     serverRef: { current: ProxyServer | null };
     logBuffer: LogBuffer;
+    /** Exit-node labels with live mihomo listeners (empty when the proxy pool is off). */
+    poolNodes: () => string[];
+    /** Fired when the credential-store membership changed (login/logout/remove) — the per-account claim fan re-syncs. */
+    onAccountsChanged?: () => void;
     /** Unwind the process; independent of whether the proxy is still running. */
     shutdown: () => void;
   },
 ): Promise<PanelServer> {
-  const { config, path, auth, serverRef, logBuffer, shutdown } = ctx;
+  const { config, path, auth, serverRef, logBuffer, poolNodes, onAccountsChanged, shutdown } = ctx;
 
   // The panel can log out (or log in another account) while `serve` keeps
-  // running, but AuthManager caches the credential in memory and auto-claim
-  // prefers it over the store — so a disk-only change would leave `/v1` and
-  // auto-claim serving the account that was just replaced (issue #58 review,
-  // P2). Fingerprint the store and re-sync after every panel command: the
-  // page polls `getLogs` every 2s, so a background login lands within one poll.
-  let authFingerprint = JSON.stringify((await loadCredential().catch(() => null)) ?? null);
+  // running, but AuthManager caches the credential in memory — so a disk-only
+  // change would leave `/v1` serving the account that was just replaced
+  // (issue #58 review, P2). Fingerprint the store and re-sync after every
+  // panel command: the page polls `getLogs` every 2s, so a background login
+  // lands within one poll.
+  let authFingerprint = JSON.stringify((await loadCredentials().catch(() => [])) ?? []);
 
   async function syncAuthWithDisk(): Promise<void> {
-    const onDisk = await loadCredential().catch(() => null);
-    const fingerprint = JSON.stringify(onDisk ?? null);
+    const onDisk = await loadCredentials().catch(() => []);
+    const fingerprint = JSON.stringify(onDisk);
     if (fingerprint === authFingerprint) return;
     authFingerprint = fingerprint;
-    if (onDisk) {
-      auth.setOAuthCredential(onDisk);
-      console.log("auth: switched to the account now on disk");
+    if (onDisk.length > 0) {
+      auth.setOAuthCredentials(onDisk);
+      console.log(`auth: switched to the ${onDisk.length} account(s) now on disk`);
     } else {
-      auth.clearOAuthCredential();
+      auth.setOAuthCredentials([]);
       console.log("auth: credential cleared (logged out)");
     }
+    // Pool membership changed (login/logout/remove) — the per-account claim
+    // schedulers must follow: new accounts start claiming, removed ones stop.
+    onAccountsChanged?.();
   }
 
   const controlState: ControlState = {
@@ -247,10 +259,9 @@ async function startServePanel(
 
   async function startProxy(): Promise<{ ok: true; port: number } | { ok: false; error: string }> {
     if (serverRef.current) return { ok: false, error: "already_running" };
-    const cred = await loadCredential().catch(() => null);
-    if (!cred) return { ok: false, error: "not_logged_in" };
-    auth.setOAuthCredential(cred);
-    authFingerprint = JSON.stringify(cred);
+    // The pool was assembled at startup (config accounts + store logins); a
+    // proxy restart just needs something in it.
+    if (!auth.getPool() || auth.getPool()!.size === 0) return { ok: false, error: "not_logged_in" };
     try {
       const s = await startServer(buildServerOptions(config, auth, false));
       serverRef.current = s;
@@ -295,7 +306,37 @@ async function startServePanel(
     onStartProxy: startProxy,
     onStopProxy: stopProxy,
     onSetConfig: setConfig,
-    onQuota: () => collectQuotaSnapshot(config),
+    onQuota: () => collectQuotaSnapshot(config, fetch, loadCredential, auth.getPool()?.snapshotEntries()),
+    getPoolStatus: () => auth.getPool()?.status() ?? [],
+    getPoolNodes: () => poolNodes(),
+    getPoolThreshold: () => auth.getPool()?.failureThreshold ?? 10,
+    onRemoveAccount: async (id: string) => {
+      if (!id.startsWith("oauth:")) {
+        return { ok: false, error: "config accounts are edited in config.yaml (pool.accounts)" };
+      }
+      const entry = auth.getPool()?.snapshotEntries().find((e) => e.id === id);
+      if (!entry) return { ok: false, error: `unknown account: ${id}` };
+      await removeStoredCredential(entry.credential);
+      auth.setOAuthCredentials(await loadCredentials().catch(() => []));
+      console.log(`pool: removed account ${entry.label}`);
+      return { ok: true };
+    },
+    onUpdateAccount: async (id: string, changes: { plan?: "coding-plan" | "start-plan"; proxy?: string }) => {
+      const entry = auth.getPool()?.snapshotEntries().find((e) => e.id === id);
+      if (!entry) return { ok: false, error: `unknown account: ${id}` };
+      if (entry.source === "config") {
+        return { ok: false, error: "config accounts are edited in config.yaml (pool.accounts)" };
+      }
+      const cred: Credential = {
+        ...entry.credential,
+        ...(changes.plan ? { plan: changes.plan } : {}),
+        ...(changes.proxy !== undefined ? { proxy: changes.proxy.trim() || undefined } : {}),
+      };
+      await saveCredential(cred);
+      auth.setOAuthCredentials(await loadCredentials().catch(() => []));
+      console.log(`pool: ${entry.label} → ${cred.plan ?? "(default)"} plan, exit ${cred.proxy ?? "auto"}`);
+      return { ok: true, ...(cred.plan ? { plan: cred.plan } : {}), proxy: cred.proxy ?? "" };
+    },
   });
 
   /** Grace period for the `shutdown` reply before `process.exit()` runs. */
@@ -356,14 +397,26 @@ async function serve(configPath: string | undefined, debug: boolean): Promise<vo
   const panelLogBuffer = panelSettings ? installLogTee() : null;
 
   const auth = new AuthManager();
-  const cred = await loadCredential();
-  if (!cred) {
-    console.error("Not logged in. Run: zcode-proxy auth login " + config.provider);
+  const creds = await loadCredentials();
+  // Managed mihomo proxy pool first, so account→node bindings are known when
+  // the account pool is assembled. Failure is loud but non-fatal (direct).
+  let mihomo: MihomoRuntime | null = null;
+  if (config.proxyPool?.enabled) {
+    mihomo = await startMihomoPool(config);
+  }
+  const pool = buildAccountPool(config.pool?.accounts ?? [], creds, {
+    failureThreshold: config.pool?.failureThreshold,
+    proxyUrls: mihomo?.endpoints.map((e) => e.url),
+    proxyLabels: mihomo?.endpoints.map((e) => e.label),
+    defaultPlan: config.plan,
+  });
+  if (!pool) {
+    console.error("Not logged in and no pool accounts configured. Run: zcode-proxy auth login " + config.provider);
     process.exit(1);
   }
-  auth.setOAuthCredential(cred);
+  auth.setPool(pool);
 
-  if (debug) printDebugBanner(config, path, cred);
+  if (debug) printDebugBanner(config, path, creds[0] ?? null, pool);
 
   const server = await startServer(buildServerOptions(config, auth, debug));
   // The optional panel can stop and restart the proxy, so the signal handlers
@@ -373,8 +426,14 @@ async function serve(configPath: string | undefined, debug: boolean): Promise<vo
   console.log(`zcode-proxy listening on ${url}`);
   // Handles for the background timers started below, so `shutdown` can clear
   // them without the proxy handle being involved (issue #58 review, P2).
-  let claimScheduler: { stop: () => void } | null = null;
+  let claimFan: { stop: () => void; refresh: () => void } | null = null;
   let captchaModule: { shutdownCaptcha: () => void } | null = null;
+  let mihomoCleanup: (() => void) | null = mihomo
+    ? () => {
+        mihomo?.stop();
+        mihomo = null;
+      }
+    : null;
 
   if (config.plan === "start-plan") {
     // Pre-solve the captcha token pool in the background so first requests
@@ -389,13 +448,15 @@ async function serve(configPath: string | undefined, debug: boolean): Promise<vo
   if (config.claim.enabled && config.claim.auto) {
     import("./claim/runtime.js")
       .then((m) => {
-        claimScheduler = m.startAutoClaim(config, auth);
-        console.log(`  claim: auto ON (poll ${Math.round(config.claim.pollIntervalMs / 1000)}s)`);
+        claimFan = m.startAutoClaim(config, auth);
+        console.log(`  claim: auto ON, per-account (poll ${Math.round(config.claim.pollIntervalMs / 1000)}s)`);
       })
       .catch((err) => console.error(`[claim] scheduler failed to start: ${(err as Error).message}`));
   }
   console.log(`  provider: ${config.provider}`);
   console.log(`  plan: ${config.plan}`);
+  console.log(`  pool: ${pool.size} account(s) (cooldown after ${pool.failureThreshold} consecutive key errors)`);
+  if (mihomo) console.log(`  proxy pool: mihomo managed (${mihomo.endpoints.length} node(s))`);
   console.log(`  models: ${config.models.length} available`);
   if (config.responses.enabled) console.log(`  /v1/responses: ON`);
   if (config.async.enabled) {
@@ -429,14 +490,14 @@ async function serve(configPath: string | undefined, debug: boolean): Promise<vo
     shuttingDown = true;
     closePanel();
     const cleared: string[] = [];
-    if (claimScheduler) {
+    if (claimFan) {
       try {
-        claimScheduler.stop();
+        claimFan.stop();
         cleared.push("auto-claim");
       } catch {
         /* already stopped */
       }
-      claimScheduler = null;
+      claimFan = null;
     }
     if (captchaModule) {
       try {
@@ -446,6 +507,15 @@ async function serve(configPath: string | undefined, debug: boolean): Promise<vo
         /* pool never started */
       }
       captchaModule = null;
+    }
+    if (mihomoCleanup) {
+      try {
+        mihomoCleanup();
+        cleared.push("mihomo");
+      } catch {
+        /* mihomo never started */
+      }
+      mihomoCleanup = null;
     }
     if (cleared.length > 0) console.log(`shutdown: cleared ${cleared.join(" + ")} timers`);
     if (serverRef.current) {
@@ -465,6 +535,8 @@ async function serve(configPath: string | undefined, debug: boolean): Promise<vo
         auth,
         serverRef,
         logBuffer: panelLogBuffer,
+        poolNodes: () => mihomo?.endpoints.map((e) => e.label) ?? [],
+        onAccountsChanged: () => claimFan?.refresh(),
         shutdown,
       });
     } catch (err) {
@@ -482,7 +554,7 @@ async function serve(configPath: string | undefined, debug: boolean): Promise<vo
   });
 }
 
-function printDebugBanner(config: ProxyConfig, path: string, cred: Credential | null): void {
+function printDebugBanner(config: ProxyConfig, path: string, cred: Credential | null, pool: { size: number; failureThreshold: number; status: () => PoolStatusEntry[] }): void {
   const credShape = cred
     ? `${cred.apiKey.slice(0, 6)}...${cred.apiKey.slice(-4)} (${cred.apiKey.length} chars)`
     : "(none)";
@@ -493,6 +565,10 @@ function printDebugBanner(config: ProxyConfig, path: string, cred: Credential | 
   console.log(`  proxy api key: ${config.auth.proxyApiKey ? "required" : "open (no client auth)"}`);
   console.log(`  provider: ${config.provider}`);
   console.log(`  plan: ${config.plan}`);
+  console.log(`  pool: ${pool.size} account(s), threshold=${pool.failureThreshold}`);
+  for (const e of pool.status()) {
+    console.log(`    - ${e.label} [${e.source}/${e.provider}]${e.proxyLabel ? ` via ${e.proxyLabel}` : ""}${e.current ? " ← current" : ""}`);
+  }
   console.log(`  identity: appVersion=${config.identity.appVersion} sourceTitle=${config.identity.sourceTitle} referer=${config.identity.refererOrigin}`);
   console.log(`  client identity: mode=${config.clientIdentity.mode} ttl=${config.clientIdentity.ttlSeconds}s max=${config.clientIdentity.maxSessions}`);
   console.log(`  anthropic base: ${active.anthropicBase}`);
@@ -518,8 +594,49 @@ function authCommand(args: string[]): void {
   }
 }
 
-async function claimCommand(args: string[]): Promise<void> {
-  const sub = args[0] ?? "now";
+/**
+ * `pool list` — static view of the account pool: config accounts + stored
+ * logins + (when proxyPool is enabled) the mihomo node each account binds to.
+ * Runtime state (strikes/cooling) is in-process only and shown by the panel.
+ */
+async function poolCommand(args: string[]): Promise<void> {
+  const sub = args[0] ?? "list";
+  if (sub !== "list") {
+    console.error("Usage: zcode-proxy pool list");
+    process.exit(1);
+  }
+  const path = process.env.ZCODE_PROXY_CONFIG ?? "config.yaml";
+  if (!existsSync(path)) {
+    console.error(`Config file not found: ${path} (run serve once or create it).`);
+    process.exit(1);
+  }
+  const config = loadConfig(path);
+  const creds = await loadCredentials();
+  const nodes = config.proxyPool?.enabled ? config.proxyPool.mihomo.nodes : [];
+  const basePort = config.proxyPool?.mihomo.listenBasePort ?? 0;
+  const pool = buildAccountPool(config.pool?.accounts ?? [], creds, {
+    failureThreshold: config.pool?.failureThreshold,
+    ...(nodes.length > 0
+      ? {
+          proxyUrls: nodes.map((_, i) => `http://127.0.0.1:${basePort + i}`),
+          proxyLabels: nodes.map((n) => String(n.name)),
+        }
+      : {}),
+    defaultPlan: config.plan,
+  });
+  if (!pool) {
+    console.log("Pool is empty — no pool.accounts in config.yaml and no stored logins.");
+    return;
+  }
+  console.log(`Account pool — ${pool.size} account(s), cooldown after ${pool.failureThreshold} consecutive key errors`);
+  for (const e of pool.status()) {
+    const proxy = e.proxyLabel ? ` via ${e.proxyLabel} (${e.proxyUrl})` : " direct";
+    console.log(`  ${e.current ? "*" : " "} ${e.label.padEnd(24)} ${e.source.padEnd(7)} ${e.provider.padEnd(9)} ${e.plan.padEnd(12)}${proxy}`);
+  }
+  if (nodes.length === 0 && config.proxyPool?.enabled) console.log("  (proxyPool enabled but no mihomo nodes configured — accounts run direct)");
+}
+
+async function claimCommand(args: string[]): Promise<void> {  const sub = args[0] ?? "now";
   if (sub !== "list" && sub !== "now") {
     console.error("Usage: zcode-proxy claim [list|now]");
     process.exit(1);
@@ -545,7 +662,8 @@ async function claimCommand(args: string[]): Promise<void> {
 /**
  * `quota` subcommand — print the live quota snapshot: per-model credit buckets
  * (billing plane) and coding-plan usage windows (monitor plane). Reuses
- * collectQuotaSnapshot (same path GET /quota serves).
+ * collectQuotaSnapshot (same path GET /quota serves); with pool accounts it
+ * prints one section per account.
  */
 async function quotaCommand(): Promise<void> {
   const path = process.env.ZCODE_PROXY_CONFIG ?? "config.yaml";
@@ -557,42 +675,61 @@ async function quotaCommand(): Promise<void> {
   const config = loadConfig(path);
   try {
     const { collectQuotaSnapshot } = await import("./server/routes-quota.js");
-    const snap = await collectQuotaSnapshot(config);
-    if (snap.balances.length === 0) {
-      console.log("No balance windows reported by the billing endpoint.");
-    }
-    for (const b of snap.balances) {
-      const exp = b.expiresAt ? ` · expires ${fmtQuotaExpiry(b.expiresAt)}` : "";
-      console.log(`  ${b.showName || "(unnamed)"}: ${b.remainingUnits.toLocaleString("en-US")} / ${b.totalUnits.toLocaleString("en-US")} units${exp}`);
-    }
-    if (snap.codingPlan) {
-      const { level, limits } = snap.codingPlan;
-      if (limits.length === 0) {
-        console.log("No coding-plan usage windows reported by the monitor endpoint.");
+    const creds = await loadCredentials();
+    const pool = buildAccountPool(config.pool?.accounts ?? [], creds);
+    const snap = await collectQuotaSnapshot(config, fetch, loadCredential, pool?.snapshotEntries());
+    if (snap.accounts) {
+      for (const a of snap.accounts) {
+        const tier = a.codingPlan?.level ? ` (${a.codingPlan.level})` : "";
+        console.log(`── ${a.label} [${a.source}/${a.provider}]${tier}`);
+        printQuotaRows(a.balances, a.codingPlan, a.claimablePlans);
       }
-      for (const l of limits) {
-        const tier = level ? ` (${level})` : "";
-        // Mirror of the official panel: remaining only — upstream `number` is
-        // not a comparable total (live TIME_LIMIT row: remaining=3894, number=1).
-        const amount =
-          l.remaining !== undefined
-            ? `${l.remaining.toLocaleString("en-US")}${l.unit ? ` ${l.unit}` : ""} remaining`
-            : "no usage numbers reported";
-        const reset = l.nextResetTime !== undefined ? ` · resets ${fmtQuotaExpiry(l.nextResetTime)}` : "";
-        console.log(`  coding-plan${tier}: [${l.type}] ${amount}${reset}`);
-      }
-    }
-    for (const plan of snap.claimablePlans) {
-      const grants = plan.entitlements
-        .map((e) => `${e.showName || plan.name}: ${(e.grantUnits ?? 0).toLocaleString("en-US")} ${e.unitType}`)
-        .join("; ");
-      console.log(`  claimable: ${plan.name}${grants ? ` (${grants})` : ""}`);
+    } else {
+      printQuotaRows(snap.balances, snap.codingPlan, snap.claimablePlans);
     }
     for (const err of snap.errors) console.error(`  ⚠ ${err}`);
     if (snap.errors.length > 0) process.exitCode = 1;
   } catch (err) {
     console.error(`quota query failed: ${(err as Error).message}`);
     process.exit(1);
+  }
+}
+
+/** Shared quota row printer (CLI + per-account sections). */
+function printQuotaRows(
+  balances: import("./server/routes-quota.js").QuotaBalanceEntry[],
+  codingPlan: import("./server/routes-quota.js").QuotaCodingPlan | null,
+  claimablePlans: import("./server/routes-quota.js").QuotaPlanEntry[],
+): void {
+  if (balances.length === 0) {
+    console.log("  No balance windows reported by the billing endpoint.");
+  }
+  for (const b of balances) {
+    const exp = b.expiresAt ? ` · expires ${fmtQuotaExpiry(b.expiresAt)}` : "";
+    console.log(`  ${b.showName || "(unnamed)"}: ${b.remainingUnits.toLocaleString("en-US")} / ${b.totalUnits.toLocaleString("en-US")} units${exp}`);
+  }
+  if (codingPlan) {
+    const { level, limits } = codingPlan;
+    if (limits.length === 0) {
+      console.log("  No coding-plan usage windows reported by the monitor endpoint.");
+    }
+    for (const l of limits) {
+      const tier = level ? ` (${level})` : "";
+      // Mirror of the official panel: remaining only — upstream `number` is
+      // not a comparable total (live TIME_LIMIT row: remaining=3894, number=1).
+      const amount =
+        l.remaining !== undefined
+          ? `${l.remaining.toLocaleString("en-US")}${l.unit ? ` ${l.unit}` : ""} remaining`
+          : "no usage numbers reported";
+      const reset = l.nextResetTime !== undefined ? ` · resets ${fmtQuotaExpiry(l.nextResetTime)}` : "";
+      console.log(`  coding-plan${tier}: [${l.type}] ${amount}${reset}`);
+    }
+  }
+  for (const plan of claimablePlans) {
+    const grants = plan.entitlements
+      .map((e) => `${e.showName || plan.name}: ${(e.grantUnits ?? 0).toLocaleString("en-US")} ${e.unitType}`)
+      .join("; ");
+    console.log(`  claimable: ${plan.name}${grants ? ` (${grants})` : ""}`);
   }
 }
 
@@ -639,10 +776,11 @@ async function authLogin(args: string[]): Promise<void> {
   }
 
   await saveCredential(cred);
+  const all = await loadCredentials();
   console.log(`\nLogged in as ${provider}.`);
   console.log(`  API Key: ${cred.apiKey.substring(0, 12)}...`);
   if (cred.userId) console.log(`  User ID: ${cred.userId}`);
-  console.log(`  Stored:  ${getStorePath()}`);
+  console.log(`  Stored:  ${getStorePath()} (${all.length} account(s) — re-login adds to the pool)`);
 }
 
 /**
@@ -705,14 +843,16 @@ function authLogout(): void {
 }
 
 async function authStatus(): Promise<void> {
-  const cred = await loadCredential();
-  if (!cred) {
+  const creds = await loadCredentials();
+  if (creds.length === 0) {
     console.log("Not logged in.");
     console.log("Run: zcode-proxy auth login <zai|bigmodel>");
     return;
   }
-  console.log(`Logged in: ${cred.provider}`);
-  console.log(`  API Key: ${cred.apiKey.substring(0, 12)}...`);
+  console.log(`Logged in: ${creds.length} OAuth account(s)`);
+  for (const cred of creds) {
+    console.log(`  [${cred.provider}] ${cred.apiKey.substring(0, 12)}...`);
+  }
   console.log(`  Store:   ${getStorePath()}`);
 }
 

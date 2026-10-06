@@ -8,13 +8,14 @@ import {
   solveViaWorkerOrInProcess,
 } from "./captcha-worker-dispatch.js";
 
-// The dispatch layer must degrade, not fail, when the worker path is
-// unusable. Worker mode is exercised with a REAL worker_threads round trip
-// against a canned fixture entry (no happy-dom, no network); the fallback
-// cases substitute the in-process solver through the test seam. Neither
-// captcha-solver.js nor captcha-happy.js is module-mocked here: those mocks
-// are process-wide in Bun and leak partial export surfaces into later test
-// files (order-dependent across platforms).
+// Default (worker) mode must degrade, not fail, when the worker path is
+// unusable; env=off (child) mode must instead FAIL a lost child — never
+// degrade to the main thread. Worker mode is exercised with a REAL
+// worker_threads round trip against a canned fixture entry (no happy-dom, no
+// network); the fallback cases substitute the in-process solver through the
+// test seam. Neither captcha-solver.js nor captcha-happy.js is module-mocked
+// here: those mocks are process-wide in Bun and leak partial export surfaces
+// into later test files (order-dependent across platforms).
 describe("captcha worker dispatch (worker / in-process)", () => {
   const fixtureDir = fs.mkdtempSync(path.join(os.tmpdir(), "cap-worker-"));
   const fixturePath = path.join(fixtureDir, "fixture-worker.mjs");
@@ -61,5 +62,71 @@ describe("captcha worker dispatch (worker / in-process)", () => {
     __resetCaptchaWorkerDispatchForTest();
     const param = await solveViaWorkerOrInProcess({ scene: "sc3", region: "rg3", prefix: "pf3" });
     expect(param).toBe("inproc-param:sc3");
+  });
+
+  test("ZCODE_CAPTCHA_WORKER=off does NOT fall back to in-process when the child dies", async () => {
+    // The no-AVX2 failure shape: worker-thread solving crashes the process
+    // uncatchably, so env=off must not spawn one. The last rung matters too:
+    // a dead child must FAIL the solve, never degrade to in-process solving —
+    // that would run captcha-happy on the MAIN thread, whose sync-XHR helper
+    // spawns its own worker_threads Worker (the exact crash we switched off)
+    // and blocks the event loop for up to 12s per sync XHR (#54 shape).
+    mock.module("./captcha-worker-asset.js", () => ({ default: fixturePath }));
+    let inProcessCalled = false;
+    __setInProcessSolverForTest(async () => {
+      inProcessCalled = true;
+      return "must-not-happen";
+    });
+    __resetCaptchaWorkerDispatchForTest();
+    process.env.ZCODE_CAPTCHA_WORKER = "off";
+    try {
+      // fixturePath only speaks the parentPort protocol — forked, it throws at
+      // load and exits nonzero (child died before answering).
+      await expect(
+        solveViaWorkerOrInProcess({ scene: "sc4", region: "rg4", prefix: "pf4" }),
+      ).rejects.toThrow(/no in-process fallback/);
+      expect(inProcessCalled).toBe(false);
+    } finally {
+      delete process.env.ZCODE_CAPTCHA_WORKER;
+    }
+  });
+
+  test("ZCODE_CAPTCHA_WORKER=off with a missing entry fails instead of solving in-process", async () => {
+    mock.module("./captcha-worker-asset.js", () => ({ default: null }));
+    __resetCaptchaWorkerDispatchForTest();
+    process.env.ZCODE_CAPTCHA_WORKER = "off";
+    try {
+      await expect(
+        solveViaWorkerOrInProcess({ scene: "sc6", region: "rg6", prefix: "pf6" }),
+      ).rejects.toThrow(/entry unavailable/);
+    } finally {
+      delete process.env.ZCODE_CAPTCHA_WORKER;
+    }
+  });
+
+  test("ZCODE_CAPTCHA_WORKER=off solves via a real forked child (child-mode entry)", async () => {
+    // The no-AVX2 fix shape: env=off forks the SAME bundle, whose dual-mode
+    // entry answers over the child_process IPC channel instead of parentPort.
+    const childFixturePath = path.join(fixtureDir, "fixture-child.cjs");
+    fs.writeFileSync(
+      childFixturePath,
+      [
+        'if (typeof process.send === "function") {',
+        '  process.on("message", (m) => process.send({ id: m.id, ok: true, param: "child-param:" + m.scene }));',
+        "} else {",
+        "  process.exit(3);",
+        "}",
+      ].join("\n"),
+      "utf8",
+    );
+    mock.module("./captcha-worker-asset.js", () => ({ default: childFixturePath }));
+    __resetCaptchaWorkerDispatchForTest();
+    process.env.ZCODE_CAPTCHA_WORKER = "off";
+    try {
+      const param = await solveViaWorkerOrInProcess({ scene: "sc5", region: "rg5", prefix: "pf5" });
+      expect(param).toBe("child-param:sc5");
+    } finally {
+      delete process.env.ZCODE_CAPTCHA_WORKER;
+    }
   });
 });

@@ -4,7 +4,7 @@
  */
 import { readFileSync, existsSync } from "node:fs";
 import { parse } from "yaml";
-import type { ClientIdentityConfig, ProxyConfig, ProviderEndpoints, ProxyIdentity, ResponsesConfig, McpConfig, AsyncConfig, EndpointRoutingConfig, ClientSigningConfig, ClaimConfig } from "./types.js";
+import type { ClientIdentityConfig, ProxyConfig, ProviderEndpoints, ProxyIdentity, ResponsesConfig, McpConfig, AsyncConfig, EndpointRoutingConfig, ClientSigningConfig, ClaimConfig, PoolConfig, ProxyPoolConfig, PoolAccountConfig } from "./types.js";
 
 /** Environment variable keys that override YAML values. */
 const ENV = {
@@ -80,6 +80,10 @@ const DEFAULTS = {
   ENDPOINT_ROUTING_ORIGIN: "https://zcode.z.ai",
   CLIENT_SIGNING_ENABLED: true,
   CLIENT_SIGNING_ORIGIN: "https://zcode.z.ai",
+  POOL_FAILURE_THRESHOLD: 10,
+  PROXY_POOL_ENABLED: false,
+  PROXY_POOL_LISTEN_BASE_PORT: 47000,
+  MIHOMO_MAX_NODES: 64,
 };
 
 /** Printable-ASCII gate copied from the ZCode bundle's `rYn` helper. */
@@ -144,6 +148,8 @@ export function loadConfig(path: string): ProxyConfig {
   const claimCfg = resolveClaimConfig(parsed?.claim);
   const endpointRouting = resolveEndpointRoutingConfig(parsed?.endpointRouting);
   const clientSigning = resolveClientSigningConfig(parsed?.clientSigning);
+  const pool = resolvePoolConfig(parsed?.pool);
+  const proxyPool = resolveProxyPoolConfig(parsed?.proxyPool);
 
   const config: ProxyConfig = {
     server: { port, host },
@@ -161,6 +167,8 @@ export function loadConfig(path: string): ProxyConfig {
     mcp,
     async: asyncCfg,
     claim: claimCfg,
+    pool,
+    proxyPool,
     logging: { level: logLevel },
   };
 
@@ -288,6 +296,81 @@ function resolveClientSigningConfig(raw: unknown): ClientSigningConfig {
   return {
     enabled: enabledEnv !== undefined ? resolveBool(enabledEnv, DEFAULTS.CLIENT_SIGNING_ENABLED) : resolveBool(obj.enabled, DEFAULTS.CLIENT_SIGNING_ENABLED),
     origin,
+  };
+}
+
+/**
+ * Account pool (`pool`). Account entries hard-validate like `resolvePlan`: a
+ * typo'd provider or a missing apiKey must fail startup loudly, not silently
+ * drop an account from the rotation (a silently smaller pool burns the
+ * remaining accounts faster — the opposite of what the pool is for).
+ */
+function resolvePoolConfig(raw: unknown): PoolConfig {
+  const obj = raw && typeof raw === "object" ? raw as Record<string, unknown> : {};
+  const accountsRaw = Array.isArray(obj.accounts) ? obj.accounts : [];
+  const accounts: PoolAccountConfig[] = accountsRaw.map((a, i) => {
+    const entry = a && typeof a === "object" ? a as Record<string, unknown> : {};
+    const provider = entry.provider;
+    if (provider !== "zai" && provider !== "bigmodel") {
+      throw new Error(`pool.accounts[${i}].provider must be "zai" or "bigmodel" (got ${JSON.stringify(provider)})`);
+    }
+    if (typeof entry.apiKey !== "string" || entry.apiKey.trim() === "") {
+      throw new Error(`pool.accounts[${i}].apiKey must be a non-empty string`);
+    }
+    if (entry.secret !== undefined && (typeof entry.secret !== "string" || entry.secret.trim() === "")) {
+      throw new Error(`pool.accounts[${i}].secret must be a non-empty string when present`);
+    }
+    if (entry.plan !== undefined && entry.plan !== "coding-plan" && entry.plan !== "start-plan") {
+      throw new Error(`pool.accounts[${i}].plan must be "coding-plan" or "start-plan" (got ${JSON.stringify(entry.plan)})`);
+    }
+    if (entry.proxy !== undefined && (typeof entry.proxy !== "string" || entry.proxy.trim() === "")) {
+      throw new Error(`pool.accounts[${i}].proxy must be a non-empty node name when present`);
+    }
+    return {
+      ...(typeof entry.label === "string" && entry.label.trim() !== "" ? { label: entry.label.trim() } : {}),
+      provider,
+      apiKey: entry.apiKey.trim(),
+      ...(typeof entry.secret === "string" ? { secret: entry.secret.trim() } : {}),
+      ...(entry.plan ? { plan: entry.plan } : {}),
+      ...(typeof entry.proxy === "string" && entry.proxy.trim() !== "" ? { proxy: entry.proxy.trim() } : {}),
+    };
+  });
+  return {
+    failureThreshold: resolvePositiveInt(obj.failureThreshold, DEFAULTS.POOL_FAILURE_THRESHOLD, "pool.failureThreshold"),
+    accounts,
+  };
+}
+
+/** Managed mihomo proxy pool (`proxyPool`). Node entries pass through verbatim; only `name` is validated. */
+function resolveProxyPoolConfig(raw: unknown): ProxyPoolConfig {
+  const obj = raw && typeof raw === "object" ? raw as Record<string, unknown> : {};
+  const mihomoRaw = obj.mihomo && typeof obj.mihomo === "object" ? obj.mihomo as Record<string, unknown> : {};
+  const nodesRaw = Array.isArray(mihomoRaw.nodes) ? mihomoRaw.nodes : [];
+  if (nodesRaw.length > DEFAULTS.MIHOMO_MAX_NODES) {
+    throw new Error(`proxyPool.mihomo.nodes supports at most ${DEFAULTS.MIHOMO_MAX_NODES} nodes (got ${nodesRaw.length})`);
+  }
+  const nodes = nodesRaw.map((n, i) => {
+    if (!n || typeof n !== "object" || Array.isArray(n)) {
+      throw new Error(`proxyPool.mihomo.nodes[${i}] must be a Clash proxies mapping`);
+    }
+    const node = n as Record<string, unknown>;
+    if (typeof node.name !== "string" || node.name.trim() === "") {
+      throw new Error(`proxyPool.mihomo.nodes[${i}].name must be a non-empty string`);
+    }
+    return node;
+  });
+  const portRaw = mihomoRaw.listenBasePort ?? mihomoRaw.listen_base_port;
+  const port = portRaw === undefined || portRaw === null ? DEFAULTS.PROXY_POOL_LISTEN_BASE_PORT : resolvePort(portRaw);
+  if (port < 1 || port > 65535) {
+    throw new Error(`proxyPool.mihomo.listenBasePort ${port} is out of range (1-65535)`);
+  }
+  return {
+    enabled: resolveBool(obj.enabled, DEFAULTS.PROXY_POOL_ENABLED),
+    mihomo: {
+      ...(typeof mihomoRaw.binary === "string" && mihomoRaw.binary.trim() !== "" ? { binary: mihomoRaw.binary.trim() } : {}),
+      listenBasePort: port,
+      nodes,
+    },
   };
 }
 

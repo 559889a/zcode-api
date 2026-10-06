@@ -474,3 +474,85 @@ identity:
     expect(cfg.identity.appVersion).toBe("3.14.0");
   });
 });
+
+describe("pool / proxyPool resolution", () => {
+  it("defaults: pool threshold 10 + empty accounts, proxyPool disabled", () => {
+    const path = writeYaml("provider: zai\n");
+    const cfg = loadConfig(path);
+    expect(cfg.pool).toEqual({ failureThreshold: 10, accounts: [] });
+    expect(cfg.proxyPool).toEqual({ enabled: false, mihomo: { listenBasePort: 47000, nodes: [] } });
+    // narrowing helpers for the optional fields (loader always fills them)
+    expect(cfg.pool!).toBeDefined();
+    expect(cfg.proxyPool!).toBeDefined();
+  });
+
+  it("parses pool accounts (label optional, secret optional) and a custom threshold", () => {
+    const path = writeYaml(`
+pool:
+  failureThreshold: 5
+  accounts:
+    - label: bm-1
+      provider: bigmodel
+      apiKey: "bm-key"
+    - provider: zai
+      apiKey: "zai-id"
+      secret: "zai-secret"
+`);
+    const cfg = loadConfig(path);
+    expect(cfg.pool!.failureThreshold).toBe(5);
+    expect(cfg.pool!.accounts).toEqual([
+      { label: "bm-1", provider: "bigmodel", apiKey: "bm-key" },
+      { provider: "zai", apiKey: "zai-id", secret: "zai-secret" },
+    ]);
+  });
+
+  it("throws on a bad account provider / empty apiKey (loud startup failure)", () => {
+    expect(() => loadConfig(writeYaml(`
+pool:
+  accounts:
+    - provider: openai
+      apiKey: "x"
+`))).toThrow(/pool\.accounts\[0\]\.provider/);
+    expect(() => loadConfig(writeYaml(`
+pool:
+  accounts:
+    - provider: zai
+      apiKey: ""
+`))).toThrow(/pool\.accounts\[0\]\.apiKey/);
+  });
+
+  it("parses proxyPool mihomo settings; nodes pass through verbatim", () => {
+    const path = writeYaml(`
+proxyPool:
+  enabled: true
+  mihomo:
+    binary: "C:/tools/mihomo.exe"
+    listenBasePort: 48000
+    nodes:
+      - name: node-jp
+        type: ss
+        server: jp.example.com
+        port: 8388
+        cipher: aes-256-gcm
+        password: "x"
+`);
+    const cfg = loadConfig(path);
+    expect(cfg.proxyPool!.enabled).toBe(true);
+    expect(cfg.proxyPool!.mihomo.binary).toBe("C:/tools/mihomo.exe");
+    expect(cfg.proxyPool!.mihomo.listenBasePort).toBe(48000);
+    expect(cfg.proxyPool!.mihomo.nodes).toEqual([
+      { name: "node-jp", type: "ss", server: "jp.example.com", port: 8388, cipher: "aes-256-gcm", password: "x" },
+    ]);
+  });
+
+  it("throws when a mihomo node has no name", () => {
+    expect(() => loadConfig(writeYaml(`
+proxyPool:
+  enabled: true
+  mihomo:
+    nodes:
+      - type: ss
+        port: 8388
+`))).toThrow(/nodes\[0\]\.name/);
+  });
+});

@@ -3,7 +3,7 @@
  * @see .omo/plans/zcode-proxy.md Task 14
  */
 import { describe, it, expect, beforeEach, afterEach } from "bun:test";
-import { saveCredential, loadCredential, clearCredential, getStorePath } from "./store.js";
+import { saveCredential, loadCredential, loadCredentials, removeStoredCredential, clearCredential, getStorePath } from "./store.js";
 import { writeFileSync, readFileSync, mkdtempSync, rmSync } from "node:fs";
 import { homedir, tmpdir } from "node:os";
 import { join } from "node:path";
@@ -108,8 +108,7 @@ describe("credential store", () => {
   });
 });
 
-describe("credential store — SHA-256 KDF migration (R2-13)", () => {
-  let storeDir: string;
+describe("credential store — SHA-256 KDF migration (R2-13)", () => {  let storeDir: string;
   beforeEach(() => {
     storeDir = useTempStore();
   });
@@ -151,5 +150,58 @@ describe("credential store — SHA-256 KDF migration (R2-13)", () => {
     writeFileSync(getStorePath(), JSON.stringify({ encrypted: foreign }), "utf-8");
     const loaded = await loadCredential();
     expect(loaded).toBeNull();
+  });
+});
+
+describe("credential store — account list semantics (account pool)", () => {
+  let storeDir: string;
+  beforeEach(() => {
+    storeDir = useTempStore();
+  });
+
+  afterEach(() => {
+    dropTempStore(storeDir);
+  });
+
+  it("saveCredential appends distinct accounts (re-login accumulates)", async () => {
+    await saveCredential({ apiKey: "zai-1", provider: "zai" });
+    await saveCredential({ apiKey: "bm-1", provider: "bigmodel" });
+    const list = await loadCredentials();
+    expect(list.map((c) => c.apiKey)).toEqual(["zai-1", "bm-1"]);
+  });
+
+  it("saveCredential refreshes an existing provider+apiKey entry in place", async () => {
+    await saveCredential({ apiKey: "zai-1", provider: "zai" });
+    await saveCredential({ apiKey: "zai-1", provider: "zai", jwt: "new-jwt" });
+    const list = await loadCredentials();
+    expect(list).toHaveLength(1);
+    expect(list[0].jwt).toBe("new-jwt");
+  });
+
+  it("loadCredential keeps the legacy single-slot contract (first entry)", async () => {
+    await saveCredential({ apiKey: "zai-1", provider: "zai" });
+    await saveCredential({ apiKey: "bm-1", provider: "bigmodel" });
+    const first = await loadCredential();
+    expect(first?.apiKey).toBe("zai-1");
+  });
+
+  it("removeStoredCredential drops one entry and clears the file when the list empties", async () => {
+    const keep: Credential = { apiKey: "zai-1", provider: "zai" };
+    const drop: Credential = { apiKey: "bm-1", provider: "bigmodel" };
+    await saveCredential(keep);
+    await saveCredential(drop);
+    await removeStoredCredential(drop);
+    expect((await loadCredentials()).map((c) => c.apiKey)).toEqual(["zai-1"]);
+    await removeStoredCredential(keep);
+    expect(await loadCredentials()).toEqual([]);
+    expect(await loadCredential()).toBeNull();
+  });
+
+  it("migrates a legacy single-object store into the list shape on load", async () => {
+    const cred: Credential = { apiKey: "legacyKey", provider: "zai" };
+    const legacyPayload = await legacyEncrypt(JSON.stringify(cred));
+    writeFileSync(getStorePath(), JSON.stringify({ encrypted: legacyPayload }), "utf-8");
+    const list = await loadCredentials();
+    expect(list).toEqual([cred]);
   });
 });

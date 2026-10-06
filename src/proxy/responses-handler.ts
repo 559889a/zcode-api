@@ -38,11 +38,11 @@ async function loadCaptcha(): Promise<CaptchaModule> {
 import { getDefaultEndpointRouting, type EndpointRoutingService } from "./endpoint-routing.js";
 import { getDefaultClientSigning, sendWithClientSigning, type ClientSigningManager } from "./client-signing.js";
 import { buildAnthropicMetadataUserId } from "./trace-headers.js";
-import { credentialString } from "../auth/types.js";
+import { credentialString, type Credential } from "../auth/types.js";
 import { translateRequestOpenAIToAnthropic, translateResponseAnthropicToOpenAI } from "../translator/openai-to-anthropic.js";
 import { anthropicSseToOpenaiSse, AnthropicStreamError } from "../translator/sse-translator.js";
 import type { AnthropicMessagesRequest, AnthropicMessagesResponse } from "../translator/types.js";
-import type { ProviderDef } from "../provider/types.js";
+import type { ProviderDef, ProviderId } from "../provider/types.js";
 import {
   responsesToChatCompletions,
   ToolTranslationError,
@@ -151,123 +151,164 @@ export async function handleResponses(
   }
   const { chatRequest, customToolNames, namespaceMap, hasToolSearch } = translated;
 
-  // ── 4. credential + provider ──
-  let cred;
-  try {
-    cred = await opts.auth.getCredential();
-  } catch (err) {
-    return errorResponse(503, "credential_unavailable", (err as Error).message);
-  }
-  const providerDef = resolveProviderDef(opts.config);
-
-  // ── 5. body transform (start-plan system / anthropic cache_control + user_id) ──
-  // Both plans post Anthropic upstream (mirrors handler.ts): the start-plan
-  // OpenAI gateway was retired server-side (404 as of 2026-08-28), so the
-  // Responses → Chat → Anthropic translator chain runs unconditionally.
-  const startPlan = opts.config.plan === "start-plan";
+  // ── 4. credential + provider (rotation loop) ──
   const upstreamFormat: "openai" | "anthropic" = "anthropic";
-  let upstreamRequestBody: string;
-  {
-    let anthropicReq: AnthropicMessagesRequest;
-    try {
-      anthropicReq = translateRequestOpenAIToAnthropic(chatRequest);
-    } catch (err) {
-      return errorResponse(400, "translation_failed", `Chat→Anthropic translation failed: ${(err as Error).message}`);
-    }
-    // userId mirrors handler.ts for BOTH plans: the bundle's `E2e` is
-    // provider-kind gated only (never plan-gated), so start-plan carries the
-    // same device/session blob as coding-plan. The /v1/responses path has no
-    // client-session resolution — session_id falls back to "" (a legal `bnt`
-    // output in the bundle).
-    upstreamRequestBody = transformRequestBody(JSON.stringify(anthropicReq), {
-      format: "anthropic",
-      metadataUserId: buildAnthropicMetadataUserId(opts.config.identity.deviceMid, undefined),
-      startPlan,
-      provider: opts.config.provider,
-    }) ?? JSON.stringify(anthropicReq);
-  }
-  const transformedBody = upstreamRequestBody;
-
-  // ── 6. POST upstream ──
-  // start-plan gates every upstream call behind an Aliyun captcha token. The
-  // Anthropic/OpenAI routes mint one in handler.ts; /v1/responses did not, so
-  // start-plan users got {"code":3007,"msg":"captcha verify failed"} surfaced
-  // as HTTP 400 upstream_error on every request.
-  let captchaHeaders: Record<string, string> | undefined;
-  if (startPlan) {
-    try {
-      const captcha = opts.captcha ?? (await loadCaptcha());
-      const token = await captcha.getCaptchaToken(opts.config.identity.appVersion);
-      captchaHeaders = { [captcha.RETRY_HEADERS.PARAM]: token.verifyParam, [captcha.RETRY_HEADERS.REGION]: token.region };
-    } catch {
-      // Fall through: the 3007 retry below solves on demand.
-    }
-  }
-  const upstreamHeaders = buildUpstreamHeaderPairs(clientReq, upstreamFormat, cred, opts.config.identity, opts.config.plan, captchaHeaders, undefined);
-  const upstreamReq = buildUpstreamRequest(clientReq, upstreamFormat, providerDef, cred, transformedBody, opts.config.identity, opts.config.plan, captchaHeaders, undefined);
-  if (debug) console.log(`[responses] → POST ${upstreamReq.url}`);
-
   const routing = opts.endpointRouting !== undefined ? opts.endpointRouting : getDefaultEndpointRouting(opts.config);
   const signer = opts.clientSigning !== undefined ? opts.clientSigning : getDefaultClientSigning(opts.config);
-  const dispatch = async (pairs: UpstreamHeaderPair[]): Promise<Response> => {
-    const routed = routing ? await routing.resolve(upstreamReq.url, credentialString(cred)) : null;
-    const sendUrl = routed?.routed ? routed.url : upstreamReq.url;
-    if (debug && routed?.routed) console.log(`[responses] endpoint routing: ${upstreamReq.url} -> ${sendUrl}`);
-    // signing decisions run against the PRE-routing provider URL (mirrors the
-    // client, whose signer wraps the routing transport)
-    return sendWithClientSigning(signer, {
-      url: upstreamReq.url,
-      headerPairs: pairs,
-      credential: credentialString(cred),
-      appVersion: opts.config.identity.appVersion,
-      debug: debug ? (message) => console.log(`[responses] ${message}`) : undefined,
-      send: (finalPairs) => {
-        const req = new Request(sendUrl, {
-          method: "POST",
-          headers: Object.fromEntries(finalPairs),
-          body: transformedBody ?? undefined,
-        });
-        return fetchImpl(req, { method: "POST", headers: Object.fromEntries(finalPairs), body: transformedBody ?? undefined, signal: clientReq.signal });
-      },
-    });
-  };
+  const pool = opts.auth.getPool?.() ?? null;
+  let legacyCred: Credential | null = null;
+  if (!pool || pool.size === 0) {
+    try {
+      legacyCred = await opts.auth.getCredential();
+    } catch (err) {
+      return errorResponse(503, "credential_unavailable", (err as Error).message);
+    }
+  }
+  const maxAttempts = (pool && pool.size > 0 ? pool.size : 1) * (pool?.failureThreshold ?? 1) + 5;
 
-  let upstreamResp: Response;
-  try {
-    // Connect-retry ladder mirrors the chat hot path (handler.ts): 3 attempts,
-    // fresh Request per dispatch (built inside `dispatch`), 500ms×attempt
-    // backoff, no retry once the client aborted.
-    upstreamResp = await dispatchWithConnectRetry(() => dispatch(upstreamHeaders), {
-      isAborted: () => clientReq.signal.aborted,
-    });
-  } catch (err) {
-    return errorResponse(502, "upstream_unreachable", (err as Error).message);
+  let upstreamResp: Response | null = null;
+  let attempt = 0;
+  // Sequential rotation, mirroring the chat hot path (handler.ts): the pool
+  // keeps returning the current account; only key-class upstream errors
+  // (429/401/403) count strikes, and the attempt cap stops a dead upstream
+  // from looping forever.
+  for (;;) {
+    attempt += 1;
+    const entry = pool && pool.size > 0 ? pool.acquire() : null;
+    const cred: Credential = entry ? entry.credential : legacyCred!;
+    const providerDef = resolveProviderDef(opts.config, cred.provider ?? opts.config.provider);
+    // Per-account plan (see handler.ts): pooled entries carry a resolved tier;
+    // start-plan additionally needs the plan JWT on the credential.
+    const startPlan = entry
+      ? entry.plan === "start-plan" && entry.credential.jwt != null
+      : opts.config.plan === "start-plan";
+
+    // ── 5. body transform (start-plan system / anthropic cache_control + user_id) ──
+    // Both plans post Anthropic upstream (mirrors handler.ts): the start-plan
+    // OpenAI gateway was retired server-side (404 as of 2026-08-28), so the
+    // Responses → Chat → Anthropic translator chain runs unconditionally.
+    let upstreamRequestBody: string;
+    {
+      let anthropicReq: AnthropicMessagesRequest;
+      try {
+        anthropicReq = translateRequestOpenAIToAnthropic(chatRequest);
+      } catch (err) {
+        return errorResponse(400, "translation_failed", `Chat→Anthropic translation failed: ${(err as Error).message}`);
+      }
+      // userId mirrors handler.ts for BOTH plans: the bundle's `E2e` is
+      // provider-kind gated only (never plan-gated), so start-plan carries the
+      // same device/session blob as coding-plan. The /v1/responses path has no
+      // client-session resolution — session_id falls back to "" (a legal `bnt`
+      // output in the bundle).
+      upstreamRequestBody = transformRequestBody(JSON.stringify(anthropicReq), {
+        format: "anthropic",
+        metadataUserId: buildAnthropicMetadataUserId(opts.config.identity.deviceMid, undefined),
+        startPlan,
+        provider: cred.provider,
+      }) ?? JSON.stringify(anthropicReq);
+    }
+    const transformedBody = upstreamRequestBody;
+
+    // ── 6. POST upstream ──
+    // start-plan gates every upstream call behind an Aliyun captcha token. The
+    // Anthropic/OpenAI routes mint one in handler.ts; /v1/responses did not, so
+    // start-plan users got {"code":3007,"msg":"captcha verify failed"} surfaced
+    // as HTTP 400 upstream_error on every request.
+    let captchaHeaders: Record<string, string> | undefined;
+    if (startPlan) {
+      try {
+        const captcha = opts.captcha ?? (await loadCaptcha());
+        const token = await captcha.getCaptchaToken(opts.config.identity.appVersion);
+        captchaHeaders = { [captcha.RETRY_HEADERS.PARAM]: token.verifyParam, [captcha.RETRY_HEADERS.REGION]: token.region };
+      } catch {
+        // Fall through: the 3007 retry below solves on demand.
+      }
+    }
+    const plan = startPlan ? "start-plan" : "coding-plan";
+    const upstreamHeaders = buildUpstreamHeaderPairs(clientReq, upstreamFormat, cred, opts.config.identity, plan, captchaHeaders, undefined);
+    const upstreamReq = buildUpstreamRequest(clientReq, upstreamFormat, providerDef, cred, transformedBody, opts.config.identity, plan, captchaHeaders, undefined);
+    if (debug) console.log(`[responses] → POST ${upstreamReq.url} (${entry ? entry.label : "single account"})`);
+
+    const dispatch = async (pairs: UpstreamHeaderPair[]): Promise<Response> => {
+      const routed = routing ? await routing.resolve(upstreamReq.url, credentialString(cred)) : null;
+      const sendUrl = routed?.routed ? routed.url : upstreamReq.url;
+      if (debug && routed?.routed) console.log(`[responses] endpoint routing: ${upstreamReq.url} -> ${sendUrl}`);
+      // signing decisions run against the PRE-routing provider URL (mirrors the
+      // client, whose signer wraps the routing transport)
+      return sendWithClientSigning(signer, {
+        url: upstreamReq.url,
+        headerPairs: pairs,
+        credential: credentialString(cred),
+        appVersion: opts.config.identity.appVersion,
+        debug: debug ? (message) => console.log(`[responses] ${message}`) : undefined,
+        send: (finalPairs) => {
+          const req = new Request(sendUrl, {
+            method: "POST",
+            headers: Object.fromEntries(finalPairs),
+            body: transformedBody ?? undefined,
+          });
+          return fetchImpl(req, { method: "POST", headers: Object.fromEntries(finalPairs), body: transformedBody ?? undefined, signal: clientReq.signal });
+        },
+      });
+    };
+
+    try {
+      // Connect-retry ladder mirrors the chat hot path (handler.ts): 3 attempts,
+      // fresh Request per dispatch (built inside `dispatch`), 500ms×attempt
+      // backoff, no retry once the client aborted.
+      upstreamResp = await dispatchWithConnectRetry(() => dispatch(upstreamHeaders), {
+        isAborted: () => clientReq.signal.aborted,
+      });
+    } catch (err) {
+      return errorResponse(502, "upstream_unreachable", (err as Error).message);
+    }
+
+    // Captcha challenge retry (mirrors handler.ts via the shared captcha-retry
+    // seam): the gateway signals it either through the captcha response header
+    // or as HTTP 400 with {"code":3007} in the body. The challenged token is
+    // already spent, so retry once with a fresh pooled one.
+    if (startPlan && !upstreamResp.ok) {
+      const captcha = opts.captcha ?? (await loadCaptcha());
+      if (await isCaptchaChallenged(upstreamResp, captcha)) {
+        if (debug) console.log("[responses] captcha challenge — re-solving and retrying once");
+        const outcome = await retryOnCaptchaChallenge({
+          captcha,
+          appVersion: opts.config.identity.appVersion,
+          challengedResp: upstreamResp,
+          debug: debug ? (message) => console.log(`[responses] ${message}`) : undefined,
+          solveAndRetry: (retryHeaders) => dispatch(
+            buildUpstreamHeaderPairs(clientReq, upstreamFormat, cred, opts.config.identity, plan, retryHeaders, undefined),
+          ),
+          mapError: (err, phase) =>
+            phase === "solver"
+              ? errorResponse(503, "captcha_solver_failed", err.message)
+              : errorResponse(502, "upstream_unreachable", err.message),
+        });
+        if (!outcome.ok) return outcome.resp;
+        upstreamResp = outcome.resp;
+      }
+    }
+
+    const keyClassError = upstreamResp.status === 429 || upstreamResp.status === 401 || upstreamResp.status === 403;
+    if (!entry || !keyClassError) {
+      if (entry) pool?.reportSuccess(entry);
+      break;
+    }
+    pool?.reportFailure(entry);
+    if (attempt >= maxAttempts) break; // exhausted: surface the last upstream error below
+    void upstreamResp.body?.cancel().catch(() => {});
+    const retryAfterSec = Number.parseInt(upstreamResp.headers.get("retry-after") ?? "", 10);
+    const backoffMs = Number.isFinite(retryAfterSec) && retryAfterSec >= 0
+      ? Math.min(retryAfterSec * 1000, 5000)
+      : Math.min(500 * attempt, 2000);
+    console.log(`[responses] upstream ${upstreamResp.status} on ${entry.label} — retrying in ${backoffMs}ms (attempt ${attempt}/${maxAttempts})`);
+    if (clientReq.signal.aborted) break;
+    await new Promise((r) => setTimeout(r, backoffMs));
   }
 
-  // Captcha challenge retry (mirrors handler.ts via the shared captcha-retry
-  // seam): the gateway signals it either through the captcha response header
-  // or as HTTP 400 with {"code":3007} in the body. The challenged token is
-  // already spent, so retry once with a fresh pooled one.
-  if (startPlan && !upstreamResp.ok) {
-    const captcha = opts.captcha ?? (await loadCaptcha());
-    if (await isCaptchaChallenged(upstreamResp, captcha)) {
-      if (debug) console.log("[responses] captcha challenge — re-solving and retrying once");
-      const outcome = await retryOnCaptchaChallenge({
-        captcha,
-        appVersion: opts.config.identity.appVersion,
-        challengedResp: upstreamResp,
-        debug: debug ? (message) => console.log(`[responses] ${message}`) : undefined,
-        solveAndRetry: (retryHeaders) => dispatch(
-          buildUpstreamHeaderPairs(clientReq, upstreamFormat, cred, opts.config.identity, opts.config.plan, retryHeaders, undefined),
-        ),
-        mapError: (err, phase) =>
-          phase === "solver"
-            ? errorResponse(503, "captcha_solver_failed", err.message)
-            : errorResponse(502, "upstream_unreachable", err.message),
-      });
-      if (!outcome.ok) return outcome.resp;
-      upstreamResp = outcome.resp;
-    }
+  if (upstreamResp === null) {
+    // Unreachable: the loop exits only via `return` or a post-response break.
+    return errorResponse(502, "upstream_unreachable", "rotation loop produced no upstream response");
   }
 
   if (!upstreamResp.ok) {
@@ -438,9 +479,9 @@ function extractSseData(frame: string): string | null {
 // Helpers
 // ─────────────────────────────────────────────
 
-function resolveProviderDef(config: ProxyConfig): ProviderDef & { openaiBaseURL: string; anthropicBaseURL: string } {
-  const base = getProvider(config.provider);
-  const endpoints = config.providers[config.provider];
+function resolveProviderDef(config: ProxyConfig, provider: ProviderId): ProviderDef & { openaiBaseURL: string; anthropicBaseURL: string } {
+  const base = getProvider(provider);
+  const endpoints = config.providers[provider];
   return {
     ...base,
     anthropicBaseURL: endpoints.anthropicBase,

@@ -11,6 +11,8 @@ export interface OrderedUpstreamRequest {
   decompress?: boolean;
   /** Client abort signal — destroys the socket the moment the client aborts. */
   signal?: AbortSignal;
+  /** Optional local proxy (mixed listener) to tunnel through via HTTP CONNECT. */
+  proxy?: string;
 }
 
 type WireSocket = Socket | TLSSocket;
@@ -71,7 +73,7 @@ export async function sendOrderedUpstreamRequest(req: OrderedUpstreamRequest): P
   const url = new URL(req.url);
   const bodyBytes = bodyToBytes(req.body);
   const requestHead = buildRequestHead(url, req.method ?? "POST", req.headers, bodyBytes.byteLength);
-  const socket = await openSocket(url);
+  const socket = await openSocket(url, req.proxy);
 
   return await new Promise<Response>((resolve, reject) => {
     let headerBuffer: Uint8Array<ArrayBufferLike> = new Uint8Array(0);
@@ -227,12 +229,14 @@ export async function sendOrderedUpstreamRequest(req: OrderedUpstreamRequest): P
   });
 }
 
-function openSocket(url: URL): Promise<WireSocket> {
+function openSocket(url: URL, proxyUrl?: string): Promise<WireSocket> {
   const isHttps = url.protocol === "https:";
   if (!isHttps && url.protocol !== "http:") {
     return Promise.reject(new Error(`Unsupported upstream protocol: ${url.protocol}`));
   }
   const port = Number(url.port || (isHttps ? 443 : 80));
+
+  if (proxyUrl) return openProxiedSocket(url, port, isHttps, proxyUrl);
 
   return new Promise((resolve, reject) => {
     const onConnect = () => {
@@ -243,6 +247,75 @@ function openSocket(url: URL): Promise<WireSocket> {
       ? connectTls({ host: url.hostname, port, servername: url.hostname }, onConnect)
       : connectTcp({ host: url.hostname, port }, onConnect);
     socket.once("error", reject);
+  });
+}
+
+/**
+ * Open the upstream through a local mixed proxy (mihomo listener) with an
+ * HTTP CONNECT tunnel — the session-affinity transport has no proxy support
+ * in its fetch stack, so the tunnel is hand-rolled: TCP to the proxy,
+ * `CONNECT host:port`, wait for a 2xx, then (for https) layer TLS on top of
+ * the established tunnel. One tunnel per request; the socket is closed by the
+ * `Connection: close` request head as before.
+ */
+async function openProxiedSocket(url: URL, port: number, isHttps: boolean, proxyUrl: string): Promise<WireSocket> {
+  const proxy = new URL(proxyUrl);
+  const proxyPort = Number(proxy.port || (proxy.protocol === "https:" ? 443 : 80));
+  const target = `${url.hostname}:${port}`;
+
+  const socket = await new Promise<Socket>((resolve, reject) => {
+    const s = connectTcp({ host: proxy.hostname, port: proxyPort }, () => {
+      s.off("error", reject);
+      resolve(s);
+    });
+    s.once("error", reject);
+  });
+
+  const readConnectResponse = (): Promise<void> =>
+    new Promise((resolve, reject) => {
+      let buf = Buffer.alloc(0);
+      const fail = (err: Error): void => {
+        socket.destroy();
+        reject(err);
+      };
+      const onData = (chunk: Buffer): void => {
+        buf = Buffer.concat([buf, chunk]);
+        const end = buf.indexOf("\r\n\r\n");
+        if (end < 0) {
+          if (buf.length > 16 * 1024) fail(new Error(`proxy ${proxyUrl} sent an oversized CONNECT response`));
+          return;
+        }
+        socket.off("data", onData);
+        socket.off("error", fail);
+        socket.off("close", onClose);
+        const status = Number.parseInt(buf.toString("latin1").split("\r\n", 1)[0]?.split(" ")[1] ?? "", 10);
+        if (!Number.isFinite(status) || status < 200 || status >= 300) {
+          fail(new Error(`proxy ${proxyUrl} rejected CONNECT to ${target} (status ${Number.isNaN(status) ? "unknown" : status})`));
+          return;
+        }
+        resolve();
+      };
+      const onClose = (): void => fail(new Error(`proxy ${proxyUrl} closed the connection during CONNECT`));
+      socket.on("data", onData);
+      socket.once("error", fail);
+      socket.once("close", onClose);
+      socket.write(`CONNECT ${target} HTTP/1.1\r\nHost: ${target}\r\n\r\n`);
+    });
+
+  try {
+    await readConnectResponse();
+  } catch (err) {
+    socket.destroy();
+    throw err;
+  }
+
+  if (!isHttps) return socket;
+  return new Promise((resolve, reject) => {
+    const tls = connectTls({ socket, servername: url.hostname }, () => {
+      tls.off("error", reject);
+      resolve(tls);
+    });
+    tls.once("error", reject);
   });
 }
 

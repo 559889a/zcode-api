@@ -201,6 +201,49 @@ export interface ClientSigningConfig {
   origin: string;
 }
 
+/**
+ * One plaintext upstream account in `pool.accounts`. Manual API keys (the
+ * user opted for config-file storage): `provider` selects the endpoint table,
+ * `secret` is the Z.AI key suffix (`{apiKey}.{secret}` form).
+ */
+export interface PoolAccountConfig {
+  /** Optional display name; defaults to `{provider}-{n}`. */
+  label?: string;
+  provider: "zai" | "bigmodel";
+  apiKey: string;
+  /** Z.AI only — appended as `{apiKey}.{secret}`. */
+  secret?: string;
+  /** Plan tier for this account. Default `coding-plan` (manual keys are coding-plan keys). */
+  plan?: "coding-plan" | "start-plan";
+  /** Exit-node label to pin this account to (must match a `proxyPool.mihomo.nodes[].name`). Default auto round-robin. */
+  proxy?: string;
+}
+
+/** Account-pool section (`pool`). Empty `accounts` = OAuth store accounts only. */
+export interface PoolConfig {
+  /** Consecutive upstream key errors (429/401/403) before an account cools down. Default 10. */
+  failureThreshold: number;
+  /** Plaintext manual accounts, merged with the OAuth login store at startup. */
+  accounts: PoolAccountConfig[];
+}
+
+/** mihomo listener-per-node settings (`proxyPool.mihomo`). */
+export interface MihomoPoolConfig {
+  /** Explicit mihomo binary path; default resolves `mihomo` from PATH. */
+  binary?: string;
+  /** First local listener port; node i listens on `listenBasePort + i`. Default 47000. */
+  listenBasePort: number;
+  /** Clash-format `proxies` entries, passed to the generated mihomo config verbatim. */
+  nodes: Record<string, unknown>[];
+}
+
+/** Managed mihomo proxy-pool section (`proxyPool`) — per-account outbound IPs. */
+export interface ProxyPoolConfig {
+  /** Spawn and manage mihomo for per-account exit-IP binding. Default `false`. */
+  enabled: boolean;
+  mihomo: MihomoPoolConfig;
+}
+
 /** Top-level proxy configuration. */
 export interface ProxyConfig {
   server: {
@@ -240,6 +283,13 @@ export interface ProxyConfig {
   async: AsyncConfig;
   /** Manual claim ("weekend plan") configuration. */
   claim: ClaimConfig;
+  /**
+   * Account pool (sequential rotation + cooldown). Always filled by
+   * `loadConfig`; optional so embedders/tests can build partial configs.
+   */
+  pool?: PoolConfig;
+  /** Managed mihomo proxy pool for per-account outbound IPs. Same optionality as `pool`. */
+  proxyPool?: ProxyPoolConfig;
   logging: {
     level: "debug" | "info" | "warn" | "error";
   };

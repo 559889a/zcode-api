@@ -17,7 +17,9 @@ import { updateConfigYaml, ensureConfigFile } from "../config/edit.js";
 import { AuthManager } from "../auth/manager.js";
 import { startServer, type ProxyServer } from "../server/server.js";
 import { buildServerOptions } from "../server/server-options.js";
-import { loadCredential, saveCredential, clearCredential } from "../auth/store.js";
+import { loadCredential, loadCredentials, saveCredential, clearCredential } from "../auth/store.js";
+import { buildAccountPool } from "../pool/pool.js";
+import { startMihomoPool, type MihomoRuntime } from "../pool/mihomo.js";
 import { ZaiOAuthClient, BigmodelOAuthClient, BigmodelPollOAuthClient, LOGIN_TIMEOUT_MS, parsePastedCallbackUrl, type OAuthFlowClient, type OAuthFlowStart, type OAuthFlowTokens } from "../auth/oauth.js";
 import { KeyResolver } from "../auth/resolver.js";
 import { openBrowser } from "../runtime/open-browser.js";
@@ -65,6 +67,7 @@ export async function runTui(args: ServeArgs): Promise<void> {
   const auth = new AuthManager();
   const pane = new LogPane(2000);
   const serverRef: { current: ProxyServer | null } = { current: null };
+  let mihomoRuntime: MihomoRuntime | null = null;
 
   const state = {
     provider: config.provider as ProviderId,
@@ -328,13 +331,29 @@ export async function runTui(args: ServeArgs): Promise<void> {
     state.serverStatus = "starting";
     state.serverError = "";
     scheduleRender();
-    const cred = await loadCredential().catch(() => null);
-    if (!cred) {
+    const creds = await loadCredentials().catch(() => []);
+    if (creds.length === 0 && (config.pool?.accounts.length ?? 0) === 0) {
       state.serverStatus = "stopped";
-      setToast("not logged in — press l to login", "err");
+      setToast("no accounts — press l to login or add pool.accounts in config.yaml", "err");
       return;
     }
-    auth.setOAuthCredential(cred);
+    // Managed mihomo proxy pool first, so account→node bindings are known.
+    if (config.proxyPool?.enabled && !mihomoRuntime) {
+      mihomoRuntime = await startMihomoPool(config);
+    }
+    const pool = buildAccountPool(config.pool?.accounts ?? [], creds, {
+      failureThreshold: config.pool?.failureThreshold,
+      proxyUrls: mihomoRuntime?.endpoints.map((e) => e.url),
+      proxyLabels: mihomoRuntime?.endpoints.map((e) => e.label),
+      defaultPlan: config.plan,
+    });
+    if (pool) {
+      auth.setPool(pool);
+      console.log(`[pool] ${pool.size} account(s) ready (cooldown threshold ${pool.failureThreshold})`);
+      for (const e of pool.status()) {
+        console.log(`[pool] ${e.label} [${e.source}/${e.provider}/${e.plan}]${e.proxyLabel ? ` via ${e.proxyLabel}` : ""}`);
+      }
+    }
     try {
       const s = await startServer(buildServerOptions(config, auth, args.debug));
       serverRef.current = s;
@@ -500,7 +519,7 @@ export async function runTui(args: ServeArgs): Promise<void> {
       const cred = await resolver.resolveCodingPlanCredential(tokens.accessToken, provider, tokens.userId);
       if (tokens.jwt) cred.jwt = tokens.jwt;
       await saveCredential(cred);
-      if (serverRef.current) auth.setOAuthCredential(cred);
+      if (serverRef.current) auth.setOAuthCredentials(await loadCredentials().catch(() => [cred]));
       console.log(`OAuth completed for ${provider}`);
       setToast("logged in", "ok");
     }).catch((err: unknown) => {
@@ -566,6 +585,7 @@ export async function runTui(args: ServeArgs): Promise<void> {
     try {
       clearCredential();
     } catch { /* best-effort logout */ }
+    auth.setOAuthCredentials([]);
     await refreshAuth();
     if (serverRef.current) setToast("logged out — restart the proxy to apply", "info");
     else setToast("logged out", "ok");
@@ -664,6 +684,7 @@ export async function runTui(args: ServeArgs): Promise<void> {
     restoreConsole();
     restoreStdio();
     try { serverRef.current?.stop(false); } catch { /* already closed */ }
+    try { mihomoRuntime?.stop(); } catch { /* never started */ }
   }
   // Render watchdog: if the 33ms render chain ever dies (stuck timer id,
   // swallowed exception in a runtime with different uncaught semantics), the
