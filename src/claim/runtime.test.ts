@@ -35,13 +35,14 @@ function entry(i: number, withJwt: boolean, proxyUrl?: string): PoolEntry {
 interface RecordedCall {
   auth: string;
   proxy?: string;
+  at: number;
 }
 
 function recorder(): { calls: RecordedCall[]; fetchStub: typeof fetch } {
   const calls: RecordedCall[] = [];
   const fetchStub = ((_url: unknown, init?: RequestInit) => {
     const headers = (init?.headers ?? {}) as Record<string, string>;
-    calls.push({ auth: headers.Authorization ?? "", proxy: (init as { proxy?: string } | undefined)?.proxy });
+    calls.push({ auth: headers.Authorization ?? "", proxy: (init as { proxy?: string } | undefined)?.proxy, at: Date.now() });
     return Promise.resolve(
       new Response(JSON.stringify({ code: 0, data: { plans: [] } }), { status: 200 }),
     );
@@ -63,7 +64,7 @@ describe("startAutoClaim per-account fan", () => {
       entry(3, false), // config-style key: no jwt, must never poll
     ];
     const { calls, fetchStub } = recorder();
-    const fan = startAutoClaim(config, stubAuth(() => entries), fetchStub);
+    const fan = startAutoClaim(config, stubAuth(() => entries), fetchStub, 0);
     try {
       await sleep(150);
       const acc1 = calls.filter((c) => c.auth === "Bearer jwt-1");
@@ -90,7 +91,7 @@ describe("startAutoClaim per-account fan", () => {
   test("refresh() follows membership: removed account stops polling, added one starts", async () => {
     const entries = [entry(1, true, "http://127.0.0.1:47001"), entry(2, true, "http://127.0.0.1:47002")];
     const { calls, fetchStub } = recorder();
-    const fan = startAutoClaim(config, stubAuth(() => entries), fetchStub);
+    const fan = startAutoClaim(config, stubAuth(() => entries), fetchStub, 0);
     try {
       await sleep(120);
       // Swap account 2 out, account 9 in (in-place array edit, as
@@ -110,6 +111,32 @@ describe("startAutoClaim per-account fan", () => {
       const acc1AtStop = calls.filter((c) => c.auth === "Bearer jwt-1").length;
       await sleep(120);
       expect(calls.filter((c) => c.auth === "Bearer jwt-1").length).toBe(acc1AtStop);
+    } finally {
+      fan.stop();
+    }
+  });
+
+  test("accounts tick staggered, never in the same instant (captcha-solve burst guard)", async () => {
+    const entries = [entry(1, true), entry(2, true), entry(3, true)];
+    const { calls, fetchStub } = recorder();
+    const fan = startAutoClaim(config, stubAuth(() => entries), fetchStub, 250);
+    try {
+      await sleep(1_200);
+      const first = (jwt: string): number | undefined => calls.find((c) => c.auth === `Bearer ${jwt}`)?.at;
+      const t1 = first("jwt-1");
+      const t2 = first("jwt-2");
+      const t3 = first("jwt-3");
+      expect(t1).toBeDefined();
+      expect(t2).toBeDefined();
+      expect(t3).toBeDefined();
+      // Index i starts ≈ i×250ms later — no two first ticks land together.
+      expect(t2! - t1!).toBeGreaterThanOrEqual(150);
+      expect(t3! - t2!).toBeGreaterThanOrEqual(150);
+      expect(t3! - t1!).toBeGreaterThanOrEqual(450);
+      // Phase drifts a few ms per cycle under setTimeout jitter (acceptable:
+      // the guard only needs to break the simultaneous burst; re-alignment
+      // after hours merely means two concurrent solves, serialized by the
+      // captcha pool lanes anyway) — so no long-window phase assertion here.
     } finally {
       fan.stop();
     }

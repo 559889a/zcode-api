@@ -33,13 +33,17 @@ export interface AutoClaimRuntime {
  * Per-account wiring is resolved LIVE from the pool snapshot at each tick:
  * the JWT, the log label, and above all the account's mihomo exit proxy —
  * claim traffic follows the same per-account exit IP as chat traffic (Bun's
- * per-request `proxy` fetch option). `start()` ticks immediately, so every
- * account gets a claim attempt at boot, then every `claim.pollIntervalMs`.
+ * per-request `proxy` fetch option). Ticks are STAGGERED (`staggerStepMs`
+ * per account index): simultaneous ticks made every account launch a captcha
+ * solve in the same instant, and the resulting burst of solve subprocesses
+ * crashed children natively on worker-unstable hosts (observed 2026-10-07).
+ * The stagger set at start persists — each scheduler keeps its own phase.
  */
 export function startAutoClaim(
   config: ProxyConfig,
   auth: AuthManager,
   fetchImpl?: (url: string | URL | Request, init?: RequestInit) => Promise<Response>,
+  staggerStepMs = 15_000,
 ): AutoClaimRuntime {
   const fetchBase = fetchImpl ?? globalThis.fetch;
   const schedulers = new Map<string, ClaimScheduler>();
@@ -61,7 +65,7 @@ export function startAutoClaim(
         schedulers.delete(id);
       }
     }
-    for (const id of live.keys()) {
+    for (const [idx, id] of [...live.keys()].entries()) {
       if (schedulers.has(id)) continue;
       const scheduler = new ClaimScheduler({
         // Live lookup, NOT a captured credential: the pool may have rotated
@@ -89,6 +93,7 @@ export function startAutoClaim(
           planId: config.claim.planId || undefined,
           pollIntervalMs: config.claim.pollIntervalMs,
           cooldownMs: config.claim.cooldownMs,
+          initialDelayMs: idx * staggerStepMs,
         },
         log: (message) => {
           const label = findEntry(id)?.label ?? id;

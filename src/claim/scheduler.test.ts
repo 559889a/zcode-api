@@ -184,6 +184,36 @@ describe("ClaimScheduler.tick", () => {
     expect((res as { holdMs: number }).holdMs).toBe(45_000);
   });
 
+  it("unknown-kind failures escalate backoff until a success resets (3012 risk-control block)", async () => {
+    const h = makeHarness({ cooldownMs: 60_000 });
+    const blocked: ClaimOutcome = { ok: false, planId: "weekend-1", failureKind: "unknown", code: 3012, message: "request has been blocked due to unusual activity." };
+    h.claimOutcome = blocked;
+    const r1 = await h.scheduler.tick();
+    expect((r1 as { holdMs: number }).holdMs).toBe(60_000); // first block: plain cooldown
+    h.nowMs += 60_000;
+    const r2 = await h.scheduler.tick();
+    expect((r2 as { holdMs: number }).holdMs).toBe(120_000); // 2×
+    h.nowMs += 120_000;
+    const r3 = await h.scheduler.tick();
+    expect((r3 as { holdMs: number }).holdMs).toBe(240_000); // 4×
+    h.nowMs += 240_000;
+    const r4 = await h.scheduler.tick();
+    expect((r4 as { holdMs: number }).holdMs).toBe(360_000); // 6× cap
+    h.nowMs += 360_000;
+    const r5 = await h.scheduler.tick();
+    expect((r5 as { holdMs: number }).holdMs).toBe(360_000); // still capped
+    // The log hints at the exit-node remedy for 3012.
+    expect(h.logs.some((m) => m.includes("3012") && m.includes("different exit node"))).toBe(true);
+    // A success clears the escalation ladder.
+    h.claimOutcome = { ok: true, planId: "weekend-1" };
+    h.nowMs += 360_000;
+    await h.scheduler.tick();
+    h.claimOutcome = blocked;
+    h.nowMs += 300_000;
+    const r6 = await h.scheduler.tick();
+    expect((r6 as { holdMs: number }).holdMs).toBe(60_000); // back to plain cooldown
+  });
+
   it("preview and captcha errors back off with cooldown", async () => {
     const h = makeHarness({ cooldownMs: 30_000 });
     h.captchaResult = new Error("solver down");

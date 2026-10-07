@@ -26,6 +26,13 @@ export interface ClaimSchedulerConfig {
   planId?: string;
   pollIntervalMs: number;
   cooldownMs: number;
+  /**
+   * Delay before the FIRST tick (fan stagger, ms). Subsequent ticks keep this
+   * scheduler's phase, so a staggered start stays staggered — keeps several
+   * accounts from launching captcha solves (and their child processes) in
+   * the same instant.
+   */
+  initialDelayMs?: number;
 }
 
 export interface ClaimSchedulerDeps {
@@ -49,6 +56,8 @@ export class ClaimScheduler {
   private stopped = false;
   private holdUntil = 0;
   private timer: ReturnType<typeof setTimeout> | null = null;
+  /** Consecutive unknown-kind failures (e.g. risk-control 3012 blocks) — drives escalating backoff. */
+  private unknownStrikes = 0;
   private readonly now: () => number;
   private readonly log: (message: string) => void;
 
@@ -63,7 +72,7 @@ export class ClaimScheduler {
 
   start(): void {
     if (this.stopped) return;
-    this.scheduleNext(0);
+    this.scheduleNext(this.deps.config.initialDelayMs ?? 0);
   }
 
   stop(): void {
@@ -137,15 +146,24 @@ export class ClaimScheduler {
     }
 
     if (outcome.ok) {
+      this.unknownStrikes = 0;
       const endsAtMs = outcome.endsAt !== undefined ? outcome.endsAt * 1000 : undefined;
       this.holdUntil = endsAtMs ?? nowMs + this.deps.config.pollIntervalMs;
       this.log(`claim: claimed plan ${target.planId}${outcome.startsAt !== undefined ? ` (activates ${new Date(outcome.startsAt * 1000).toISOString()})` : ""}`);
       return { action: "claimed", planId: target.planId, startsAt: outcome.startsAt, endsAt: outcome.endsAt };
     }
 
+    // Unknown-kind failures (risk-control 3012 blocks et al.) escalate: hammering
+    // a blocked account every cooldown looks like more "unusual activity" and
+    // likely extends the block. Any classified failure or success resets.
+    if (outcome.failureKind === "unknown") this.unknownStrikes += 1;
+    else this.unknownStrikes = 0;
     const holdMs = this.holdForFailure(outcome.failureKind, outcome.failureEndsAt, nowMs);
     this.holdUntil = nowMs + holdMs;
-    this.log(`claim: ${outcome.failureKind} (${outcome.code}) — ${outcome.message}; retry in ${Math.round(holdMs / 1000)}s`);
+    const blockedHint = String(outcome.code) === "3012"
+      ? " — risk-control block: consider a different exit node for this account (panel → Accounts)"
+      : "";
+    this.log(`claim: ${outcome.failureKind} (${outcome.code}) — ${outcome.message}; retry in ${Math.round(holdMs / 1000)}s${blockedHint}`);
     if (outcome.failureKind === "login_required") {
       this.stop();
     }
@@ -164,6 +182,12 @@ export class ClaimScheduler {
     if ((kind === "already_claimed" || kind === "quota_exhausted") && Number.isFinite(failureEndsAtSec)) {
       const untilMs = (failureEndsAtSec as number) * 1000;
       if (untilMs > nowMs) return Math.min(untilMs - nowMs, 24 * 60 * 60 * 1000);
+    }
+    if (kind === "unknown") {
+      // Escalate per consecutive unknown failure, capped at 6× cooldown
+      // (e.g. 10min → 20 → 40 → 60min). Cleared by a success.
+      const factor = Math.min(2 ** Math.max(0, this.unknownStrikes - 1), 6);
+      return Math.min(this.deps.config.cooldownMs * factor, 6 * 60 * 60 * 1000);
     }
     return this.deps.config.cooldownMs;
   }
