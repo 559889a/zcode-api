@@ -1,8 +1,9 @@
 import { describe, expect, test } from "bun:test";
 import type { AuthManager } from "../auth/manager.js";
+import type { Credential } from "../auth/types.js";
 import type { ProxyConfig } from "../config/types.js";
 import type { PoolEntry } from "../pool/pool.js";
-import { startAutoClaim } from "./runtime.js";
+import { runClaimCli, startAutoClaim } from "./runtime.js";
 
 /**
  * startAutoClaim fans one scheduler out per jwt-bearing pool account and
@@ -140,5 +141,90 @@ describe("startAutoClaim per-account fan", () => {
     } finally {
       fan.stop();
     }
+  });
+});
+
+describe("runClaimCli (one-shot, all accounts)", () => {
+  const cliConfig = {
+    claim: { origin: "https://claim.test", planId: "", pollIntervalMs: 300_000, cooldownMs: 600_000, captchaViaExit: true },
+    identity: { appVersion: "3.12.3", deviceMid: "0f0e0d0c-0000-4000-8000-000000000001" },
+  } as unknown as ProxyConfig;
+
+  // Wire shape uses snake_case (parsePlan reads plan_id).
+  const PLAN = { plan_id: "egg-1", name: "Egg", description: "", priority: 1, entitlements: [] };
+
+  function stubCreds(n: number): Credential[] {
+    return Array.from({ length: n }, (_, i) => ({
+      apiKey: `cli-key-${i}`,
+      provider: "zai",
+      jwt: `cli-jwt-${i}`,
+    })) as Credential[];
+  }
+
+  test("now mode claims for EVERY stored account, each with its own JWT, gapped", async () => {
+    const creds = stubCreds(2);
+    const claimPosts: Array<{ auth: string; captcha: string }> = [];
+    const fetchStub = ((_url: unknown, init?: RequestInit) => {
+      const headers = (init?.headers ?? {}) as Record<string, string>;
+      if (init?.method === "POST") {
+        claimPosts.push({ auth: headers.Authorization ?? "", captcha: headers["X-Aliyun-Captcha-Verify-Param"] ?? "" });
+        // First account succeeds, second is risk-blocked — exercises both arms.
+        const ok = headers.Authorization === "Bearer cli-jwt-0";
+        return Promise.resolve(
+          new Response(JSON.stringify(ok ? { code: 0, data: { plan: { plan_id: "egg-1" } } } : { code: 3012, msg: "blocked" }), { status: 200 }),
+        );
+      }
+      return Promise.resolve(new Response(JSON.stringify({ code: 0, data: { plans: [PLAN] } }), { status: 200 }));
+    }) as unknown as typeof fetch;
+
+    const res = await runClaimCli(cliConfig, "now", {
+      gapMs: 0,
+      fetchImpl: fetchStub,
+      getCaptcha: async () => ({ verifyParam: "cap-param", region: "sgp" }),
+      loadCreds: async () => creds,
+    });
+
+    expect(res).toEqual({ attempted: 2, claimed: 1, failed: 1 });
+    expect(claimPosts.map((p) => p.auth)).toEqual(["Bearer cli-jwt-0", "Bearer cli-jwt-1"]);
+    expect(claimPosts.every((p) => p.captcha === "cap-param")).toBe(true);
+  });
+
+  test("gap between accounts is real (not one burst), and list mode never claims", async () => {
+    const creds = stubCreds(2);
+    const gapSamples: number[] = [];
+    let last = 0;
+    const fetchStub = ((_url: unknown, init?: RequestInit) => {
+      if (init?.method === "POST") {
+        const now = Date.now();
+        if (last) gapSamples.push(now - last);
+        last = now;
+      }
+      return Promise.resolve(new Response(JSON.stringify({ code: 0, data: { plans: [PLAN] } }), { status: 200 }));
+    }) as unknown as typeof fetch;
+
+    await runClaimCli(cliConfig, "list", {
+      fetchImpl: fetchStub,
+      getCaptcha: async () => ({ verifyParam: "cap", region: "sgp" }),
+      loadCreds: async () => creds,
+    });
+    expect(gapSamples.length).toBe(0); // list is read-only
+
+    last = 0;
+    gapSamples.length = 0;
+    await runClaimCli(cliConfig, "now", {
+      gapMs: 120,
+      fetchImpl: fetchStub,
+      getCaptcha: async () => ({ verifyParam: "cap", region: "sgp" }),
+      loadCreds: async () => creds,
+    });
+    expect(gapSamples.length).toBe(1);
+    expect(gapSamples[0]).toBeGreaterThanOrEqual(80); // ~120ms gap, timer tolerance
+  });
+
+  test("no stored JWTs reports and counts one failure (old exit-1 behavior)", async () => {
+    const res = await runClaimCli(cliConfig, "now", {
+      loadCreds: async () => [] as Credential[],
+    });
+    expect(res).toEqual({ attempted: 0, claimed: 0, failed: 1 });
   });
 });

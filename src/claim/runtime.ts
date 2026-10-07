@@ -4,13 +4,14 @@
  * implements the one-shot CLI flow (`zcode-proxy claim [list|now]`).
  */
 import type { AuthManager } from "../auth/manager.js";
+import type { Credential } from "../auth/types.js";
 import type { ProxyConfig } from "../config/types.js";
 import type { PoolEntry } from "../pool/pool.js";
 import type { ClaimablePlan, ClaimOutcome } from "./types.js";
 import { createClaimClient, ClaimPreviewError } from "./client.js";
 import { ClaimScheduler } from "./scheduler.js";
 import { getCaptchaToken, solveCaptchaTokenViaProxy } from "../proxy/captcha.js";
-import { loadCredential } from "../auth/store.js";
+import { loadCredentials } from "../auth/store.js";
 
 /** `${process.platform}-${process.arch}` — mirrors the client's `TH()`. */
 export function claimPlatform(): string {
@@ -43,7 +44,7 @@ export function startAutoClaim(
   config: ProxyConfig,
   auth: AuthManager,
   fetchImpl?: (url: string | URL | Request, init?: RequestInit) => Promise<Response>,
-  staggerStepMs = 15_000,
+  staggerStepMs = 30_000,
 ): AutoClaimRuntime {
   const fetchBase = fetchImpl ?? globalThis.fetch;
   const schedulers = new Map<string, ClaimScheduler>();
@@ -143,54 +144,100 @@ const FAILURE_LABELS: Record<string, string> = {
   unknown: "unknown failure",
 };
 
-/** One-shot CLI: `list` prints previews; `now` claims the target plan. */
-export async function runClaimCli(config: ProxyConfig, mode: "list" | "now"): Promise<void> {
-  const cred = await loadCredential();
-  const jwt = cred?.jwt;
-  if (!jwt) {
+export interface ClaimCliOptions {
+  /** Pause between accounts in `now` mode (default 30s — accounts must not claim as one burst). */
+  gapMs?: number;
+  /** DI seams for tests (defaults: globalThis.fetch / real captcha / real store). */
+  fetchImpl?: (url: string | URL | Request, init?: RequestInit) => Promise<Response>;
+  getCaptcha?: (appVersion: string) => Promise<{ verifyParam: string; region: string }>;
+  loadCreds?: () => Promise<Credential[]>;
+}
+
+/** `runClaimCli` result — `claimCommand` maps failed>0 to exit code 1. */
+export interface ClaimCliResult {
+  attempted: number;
+  claimed: number;
+  failed: number;
+}
+
+/**
+ * One-shot CLI over EVERY stored OAuth account (used to be first-only):
+ * `list` prints each account's previews; `now` claims the target plan per
+ * account with a gap between accounts so five claims never hit the gateway
+ * as one burst. Egress note: the CLI has no mihomo pool — preview, captcha
+ * mint and claim all go DIRECT, so mint-IP == use-IP (no 3012 mismatch);
+ * per-account exits are the serving fan's job (startAutoClaim).
+ */
+export async function runClaimCli(config: ProxyConfig, mode: "list" | "now", opts: ClaimCliOptions = {}): Promise<ClaimCliResult> {
+  const gapMs = opts.gapMs ?? 30_000;
+  const fetchImpl = opts.fetchImpl ?? globalThis.fetch;
+  const getCaptcha = opts.getCaptcha ?? getCaptchaToken;
+  const loadCreds = opts.loadCreds ?? loadCredentials;
+
+  const creds = (await loadCreds().catch(() => [] as Credential[])).filter((c) => c.jwt);
+  if (creds.length === 0) {
     console.error("Claim requires a logged-in oauth credential (no JWT stored). Run: zcode-proxy auth login <zai|bigmodel>");
-    process.exit(1);
+    return { attempted: 0, claimed: 0, failed: 1 };
   }
-  const client = createClaimClient({
-    origin: config.claim.origin,
-    jwt,
-    appVersion: config.identity.appVersion,
-    platform: claimPlatform(),
-    deviceMid: config.identity.deviceMid,
-  });
 
-  let plans: ClaimablePlan[];
-  try {
-    plans = await client.getPreviews();
-  } catch (err) {
-    if (err instanceof ClaimPreviewError && err.status === 404) {
-      console.log("No claimable plans: the campaign endpoint is not deployed yet (404).");
-      console.log("Weekend campaigns typically go live shortly before the window — keep the proxy");
-      console.log("serving with claim.enabled, or re-run this command later.");
-      return;
+  const res: ClaimCliResult = { attempted: 0, claimed: 0, failed: 0 };
+  for (const [i, cred] of creds.entries()) {
+    const label = `${cred.provider}-oauth${i + 1}`;
+    if (mode === "now" && i > 0) {
+      console.log(`\nWaiting ${Math.round(gapMs / 1000)}s before the next account (claims stay spread) ...`);
+      await new Promise((r) => setTimeout(r, gapMs));
     }
-    throw err;
-  }
-  if (plans.length === 0) {
-    console.log("No claimable plans right now.");
-    return;
-  }
-  printPlans(plans);
+    console.log(`\n=== ${label} (${cred.provider}) ===`);
+    const client = createClaimClient({
+      origin: config.claim.origin,
+      jwt: cred.jwt,
+      appVersion: config.identity.appVersion,
+      platform: claimPlatform(),
+      deviceMid: config.identity.deviceMid,
+      fetchImpl,
+    });
 
-  if (mode === "list") return;
+    let plans: ClaimablePlan[];
+    try {
+      plans = await client.getPreviews();
+    } catch (err) {
+      if (err instanceof ClaimPreviewError && err.status === 404) {
+        console.log("No claimable plans: the campaign endpoint is not deployed yet (404).");
+        console.log("Weekend campaigns typically go live shortly before the window — keep the proxy");
+        console.log("serving with claim.enabled, or re-run this command later.");
+        continue;
+      }
+      console.error(`Preview failed: ${(err as Error).message}`);
+      res.failed += 1;
+      continue;
+    }
+    if (plans.length === 0) {
+      console.log("No claimable plans right now.");
+      continue;
+    }
+    printPlans(plans);
+    if (mode === "list") continue;
 
-  const wanted = config.claim.planId.trim();
-  const target = wanted ? plans.find((p) => p.planId === wanted) : [...plans].sort((a, b) => b.priority - a.priority)[0];
-  if (!target) {
-    console.error(`Configured claim.planId "${wanted}" not in the preview list.`);
-    process.exit(1);
+    const wanted = config.claim.planId.trim();
+    const target = wanted ? plans.find((p) => p.planId === wanted) : [...plans].sort((a, b) => b.priority - a.priority)[0];
+    if (!target) {
+      console.error(`Configured claim.planId "${wanted}" not in the preview list.`);
+      res.failed += 1;
+      continue;
+    }
+    if (target.planId !== plans[0].planId) console.log(`Claiming configured plan: ${target.planId}`);
+
+    res.attempted += 1;
+    const captcha = await getCaptcha(config.identity.appVersion);
+    const outcome = await client.claim(target.planId, { verifyParam: captcha.verifyParam, region: captcha.region || undefined });
+    printOutcome(outcome);
+    if (outcome.ok) res.claimed += 1;
+    else res.failed += 1;
   }
-  if (target.planId !== plans[0].planId) console.log(`Claiming configured plan: ${target.planId}`);
-
-  const captcha = await getCaptchaToken(config.identity.appVersion);
-  const outcome = await client.claim(target.planId, { verifyParam: captcha.verifyParam, region: captcha.region || undefined });
-  printOutcome(outcome);
-  if (!outcome.ok) process.exit(1);
+  if (mode === "now" && res.attempted > 0) {
+    console.log(`\nClaim run: ${res.claimed} claimed, ${res.failed} failed, ${creds.length - res.attempted} with nothing to claim.`);
+  }
+  return res;
 }
 
 function printPlans(plans: ClaimablePlan[]): void {

@@ -652,7 +652,8 @@ async function claimCommand(args: string[]): Promise<void> {  const sub = args[0
   const config = loadConfig(path);
   try {
     const { runClaimCli } = await import("./claim/runtime.js");
-    await runClaimCli(config, sub);
+    const res = await runClaimCli(config, sub);
+    if (res.failed > 0) process.exit(1);
   } catch (err) {
     console.error(`claim failed: ${(err as Error).message}`);
     process.exit(1);
