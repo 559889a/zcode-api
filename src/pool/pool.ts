@@ -134,6 +134,11 @@ export class AccountPool {
     return this.entries.length;
   }
 
+  /** All exit-node endpoints (mihomo listeners) in node order — the candidate list for exit auto-rotation (claim fan). */
+  exitTargets(): Array<{ label: string; url: string }> {
+    return this.proxyUrls.map((url, i) => ({ label: this.proxyLabels[i] ?? url, url }));
+  }
+
   /**
    * Replace the oauth-sourced entries (config entries and their state are
    * kept). States of surviving ids persist; removed ids are dropped; the

@@ -144,6 +144,134 @@ describe("startAutoClaim per-account fan", () => {
   });
 });
 
+describe("startAutoClaim exit auto-rotation (auto node testing)", () => {
+  const DEAD = "http://127.0.0.1:47004"; // pinned, stalls the mint
+  const USED = "http://127.0.0.1:47001"; // another account's exit — never a candidate
+  const CAND_A = "http://127.0.0.1:47006"; // probe 1: also bad
+  const CAND_B = "http://127.0.0.1:47012"; // probe 2: healthy — must win
+  const CAND_C = "http://127.0.0.1:47015";
+  const TARGETS = [
+    { label: "ikuu-01", url: USED },
+    { label: "ikuu-05", url: DEAD },
+    { label: "ikuu-07", url: CAND_A },
+    { label: "ikuu-13", url: CAND_B },
+    { label: "ikuu-16", url: CAND_C },
+  ];
+  const STALL = new Error("captcha child process timeout (20000ms)");
+  const PLAN = { plan_id: "egg-1", name: "Egg", description: "", priority: 1, entitlements: [] };
+
+  /**
+   * Preview yields the plan only on the FIRST GET for jwt-1 (the rotating
+   * account); every other account/account-2 preview is empty so the fan's
+   * second scheduler never mints — its exit exists only to test exclusion.
+   */
+  function claimRecorder(): {
+    posts: Array<{ auth: string; captcha: string; proxy?: string }>;
+    fetchStub: typeof fetch;
+  } {
+    const posts: Array<{ auth: string; captcha: string; proxy?: string }> = [];
+    let jwt1SawPlan = false;
+    const fetchStub = ((_url: unknown, init?: RequestInit) => {
+      const headers = (init?.headers ?? {}) as Record<string, string>;
+      if (init?.method === "POST") {
+        posts.push({
+          auth: headers.Authorization ?? "",
+          captcha: headers["X-Aliyun-Captcha-Verify-Param"] ?? "",
+          proxy: (init as { proxy?: string } | undefined)?.proxy,
+        });
+        return Promise.resolve(new Response(JSON.stringify({ code: 0, data: { plan: { plan_id: "egg-1" } } }), { status: 200 }));
+      }
+      const plans = headers.Authorization === "Bearer jwt-1" && !jwt1SawPlan ? [PLAN] : [];
+      if (plans.length) jwt1SawPlan = true;
+      return Promise.resolve(new Response(JSON.stringify({ code: 0, data: { plans } }), { status: 200 }));
+    }) as unknown as typeof fetch;
+    return { posts, fetchStub };
+  }
+
+  function rotationAuth(entries: () => PoolEntry[]): AuthManager {
+    return { getPool: () => ({ snapshotEntries: entries, exitTargets: () => TARGETS }) } as unknown as AuthManager;
+  }
+
+  test("stalled mint probes unused nodes, re-pins, and claims through the new exit", async () => {
+    const entries = [entry(1, true, DEAD), entry(2, true, USED)];
+    const { posts, fetchStub } = claimRecorder();
+    const mintUrls: string[] = [];
+    const pins: Array<{ id: string; node: string }> = [];
+    const fan = startAutoClaim(config, rotationAuth(() => entries), fetchStub, 0, {
+      mintViaExit: async (_appVersion, url) => {
+        mintUrls.push(url);
+        if (url === CAND_B) return { verifyParam: "rotated-token", region: "cn" };
+        throw new Error(STALL.message);
+      },
+      pinSaver: async (id, node) => {
+        pins.push({ id, node });
+        // Simulate the pool rebuild: the account now egresses via the new pin.
+        const e = entries.find((x) => x.id === id);
+        if (e) e.proxyUrl = TARGETS.find((t) => t.label === node)?.url;
+      },
+    });
+    try {
+      await sleep(300);
+      // Mint order: pinned DEAD first, then candidates AFTER ikuu-05 in label
+      // order, skipping USED (owned by account 2) — ikuu-07 fails, ikuu-13 wins.
+      expect(mintUrls).toEqual([DEAD, CAND_A, CAND_B]);
+      expect(pins).toEqual([{ id: "oauth:zai:key1", node: "ikuu-13" }]);
+      // The claim POST used the probe token AND egressed via the new exit.
+      expect(posts).toHaveLength(1);
+      expect(posts[0].auth).toBe("Bearer jwt-1");
+      expect(posts[0].captcha).toBe("rotated-token");
+      expect(posts[0].proxy).toBe(CAND_B);
+      // Account 2's idle previews never minted anything.
+      expect(mintUrls.every((u) => u !== USED)).toBe(true);
+    } finally {
+      fan.stop();
+    }
+  });
+
+  test("all candidate nodes unhealthy: no claim, pin untouched, mint kept to the same node", async () => {
+    const entries = [entry(1, true, DEAD), entry(2, true, USED)];
+    const { posts, fetchStub } = claimRecorder();
+    const pins: string[] = [];
+    const fan = startAutoClaim(config, rotationAuth(() => entries), fetchStub, 0, {
+      mintViaExit: async () => {
+        throw new Error(STALL.message);
+      },
+      pinSaver: async (_id, node) => {
+        pins.push(node);
+      },
+    });
+    try {
+      await sleep(250);
+      expect(posts).toHaveLength(0);
+      expect(pins).toHaveLength(0);
+      expect(entries[0].proxyUrl).toBe(DEAD);
+    } finally {
+      fan.stop();
+    }
+  });
+
+  test("non-stall mint errors (e.g. configs fetch down) never trigger rotation", async () => {
+    const entries = [entry(1, true, DEAD)];
+    const { posts, fetchStub } = claimRecorder();
+    const mintUrls: string[] = [];
+    const fan = startAutoClaim(config, rotationAuth(() => entries), fetchStub, 0, {
+      mintViaExit: async (_appVersion, url) => {
+        mintUrls.push(url);
+        throw new Error("Captcha config unavailable");
+      },
+    });
+    try {
+      await sleep(200);
+      expect(posts).toHaveLength(0);
+      // Repeated ticks all retried the SAME pinned exit — no probe ever ran.
+      expect(mintUrls.length).toBeGreaterThanOrEqual(1);
+      expect(mintUrls.every((u) => u === DEAD)).toBe(true);
+    } finally {
+      fan.stop();
+    }
+  });
+});
+
 describe("runClaimCli (one-shot, all accounts)", () => {
   const cliConfig = {
     claim: { origin: "https://claim.test", planId: "", pollIntervalMs: 300_000, cooldownMs: 600_000, captchaViaExit: true },

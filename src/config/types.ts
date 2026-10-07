@@ -172,6 +172,14 @@ export interface ClaimConfig {
    * falls back to the shared direct-minted token pool. Default `true`.
    */
   captchaViaExit: boolean;
+  /**
+   * When a via-exit captcha mint stalls (dead exit node), probe up to 4
+   * unused nodes with real mints and re-pin the account to the first healthy
+   * one — the probe token is used for the claim, so dead nodes never hold an
+   * account hostage. `false` = keep the pinned node and just back off.
+   * Default `true`. Optional for backwards config compatibility.
+   */
+  exitAutoRotate?: boolean;
   /** Optional `plan_id` to claim; empty string claims the highest-priority preview. Default `""`. */
   planId: string;
 }

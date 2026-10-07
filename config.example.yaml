@@ -180,6 +180,12 @@ claim:
   # minted token used from another IP is flagged as unusual activity, biz
   # 3012). false = shared direct-minted token pool (pre-proxy-pool behavior).
   captchaViaExit: true
+  # Auto node testing: when a via-exit captcha mint stalls (dead exit node),
+  # probe up to 4 unused nodes with REAL mints and re-pin the account to the
+  # first healthy one — the probe token is used for the claim itself, so a
+  # flappy node never holds an account hostage (curl-style GET probes pass on
+  # mint-dead nodes, so the mint IS the test). false = keep the pin + back off.
+  exitAutoRotate: true
   # Backoff after failed attempts (10 min default); quota_exhausted /
   # already_claimed back off to the server-provided next window instead.
   cooldownMs: 600000

@@ -76,6 +76,7 @@ const DEFAULTS = {
   CLAIM_POLL_INTERVAL_MS: 600000,
   CLAIM_COOLDOWN_MS: 600000,
   CLAIM_CAPTCHA_VIA_EXIT: true,
+  CLAIM_EXIT_AUTO_ROTATE: true,
   CLAIM_PLAN_ID: "",
   ENDPOINT_ROUTING_ENABLED: true,
   ENDPOINT_ROUTING_ORIGIN: "https://zcode.z.ai",
@@ -483,6 +484,7 @@ function resolveClaimConfig(raw: unknown): ClaimConfig {
     pollIntervalMs: resolvePositiveInt(pollIntervalEnv ?? obj.pollIntervalMs ?? obj.poll_interval_ms, DEFAULTS.CLAIM_POLL_INTERVAL_MS, "claim.pollIntervalMs"),
     cooldownMs: resolvePositiveInt(obj.cooldownMs ?? obj.cooldown_ms, DEFAULTS.CLAIM_COOLDOWN_MS, "claim.cooldownMs"),
     captchaViaExit: resolveBool(obj.captchaViaExit ?? obj.captcha_via_exit, DEFAULTS.CLAIM_CAPTCHA_VIA_EXIT),
+    exitAutoRotate: resolveBool(obj.exitAutoRotate ?? obj.exit_auto_rotate, DEFAULTS.CLAIM_EXIT_AUTO_ROTATE),
     planId: typeof obj.planId === "string" ? obj.planId.trim() : DEFAULTS.CLAIM_PLAN_ID,
   };
 }

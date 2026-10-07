@@ -64,3 +64,13 @@ export function classifyClaimCode(code: number | string | undefined): ClaimFailu
     default: return "unknown";
   }
 }
+
+/**
+ * Mint-stall signature: per-fetch timeout / SDK stall / dead exit node — as
+ * opposed to e.g. "Captcha config unavailable" (a DIRECT configs fetch that
+ * no exit rotation can fix). Drives both the scheduler's failure hint and
+ * the fan's exit auto-rotation (claim/runtime.ts).
+ */
+export function looksLikeMintStall(message: string): boolean {
+  return /timeout|timed out|stall|passthrough failed|sync fetch|sync-xhr/i.test(message);
+}

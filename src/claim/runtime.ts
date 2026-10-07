@@ -8,10 +8,11 @@ import type { Credential } from "../auth/types.js";
 import type { ProxyConfig } from "../config/types.js";
 import type { PoolEntry } from "../pool/pool.js";
 import type { ClaimablePlan, ClaimOutcome } from "./types.js";
+import { looksLikeMintStall } from "./types.js";
 import { createClaimClient, ClaimPreviewError } from "./client.js";
 import { ClaimScheduler } from "./scheduler.js";
 import { getCaptchaToken, solveCaptchaTokenViaProxy } from "../proxy/captcha.js";
-import { loadCredentials } from "../auth/store.js";
+import { loadCredentials, saveCredential } from "../auth/store.js";
 
 /** `${process.platform}-${process.arch}` — mirrors the client's `TH()`. */
 export function claimPlatform(): string {
@@ -24,6 +25,28 @@ export interface AutoClaimRuntime {
   /** Re-resolve the account list after logins/logouts/removals. Surviving accounts keep their hold state. */
   refresh(): void;
 }
+
+/** DI seams + tuning for the fan's exit auto-rotation (defaults: real mint + real pin persistence). */
+export interface AutoClaimOptions {
+  mintViaExit?: typeof solveCaptchaTokenViaProxy;
+  /** Persists a new exit-node pin for an account (default: saveCredential + pool rebuild). */
+  pinSaver?: (id: string, node: string) => Promise<void>;
+  /** Max alternative nodes probed per failed mint (default 4). */
+  maxExitProbes?: number;
+}
+
+/**
+ * Free-airport nodes flap on the captcha solve's slow POSTs (a node can GET
+ * in <1s while mints hang — observed 2026-10-07, ~half a 6-node sweep bad at
+ * once), so a dead pin used to strand an account until someone switched the
+ * exit by hand. ponytail: ceiling — the rotation probe is the CLAIM MINT
+ * ITSELF (the only reliable health signal; curl-style GET probes pass on
+ * mint-dead nodes), tried against at most `maxExitProbes` unused nodes after
+ * the pinned one stalls; the winning probe token is used for the claim, so a
+ * rotation costs zero extra mints. Upgrade path: a persistent background
+ * node-health map if chat-plane exits ever need pre-emptive rotation.
+ */
+const MAX_EXIT_PROBES = 4;
 
 /**
  * Auto-claim for EVERY pool account with a JWT — one independent
@@ -45,13 +68,24 @@ export function startAutoClaim(
   auth: AuthManager,
   fetchImpl?: (url: string | URL | Request, init?: RequestInit) => Promise<Response>,
   staggerStepMs = 30_000,
+  opts: AutoClaimOptions = {},
 ): AutoClaimRuntime {
   const fetchBase = fetchImpl ?? globalThis.fetch;
+  const mintViaExit = opts.mintViaExit ?? solveCaptchaTokenViaProxy;
+  const maxExitProbes = opts.maxExitProbes ?? MAX_EXIT_PROBES;
   const schedulers = new Map<string, ClaimScheduler>();
   let halted = false;
 
   const findEntry = (id: string): PoolEntry | undefined =>
     auth.getPool()?.snapshotEntries().find((e) => e.id === id);
+
+  /** Persist a new exit pin for an account and rebuild the pool (same path the panel's updateAccount takes). */
+  const pinSaver = opts.pinSaver ?? (async (id: string, node: string) => {
+    const cred = findEntry(id)?.credential as Credential | undefined;
+    if (!cred?.jwt) throw new Error(`account ${id} not found for exit rotation`);
+    await saveCredential({ ...cred, proxy: node });
+    auth.setOAuthCredentials(await loadCredentials().catch(() => [] as Credential[]));
+  });
 
   const refresh = (): void => {
     if (halted) return;
@@ -91,12 +125,63 @@ export function startAutoClaim(
           // a token minted direct but used from the account's exit IP is the
           // mint-IP ≠ use-IP mismatch risk control flags as "unusual
           // activity" (biz 3012). No exit / opted out → shared direct pool.
-          const exit = findEntry(id)?.proxyUrl;
+          const appVersion = config.identity.appVersion;
+          const entry0 = findEntry(id);
+          const exit = entry0?.proxyUrl;
           const viaExit = exit && config.claim.captchaViaExit !== false;
-          const { verifyParam, region } = viaExit
-            ? await solveCaptchaTokenViaProxy(config.identity.appVersion, exit)
-            : await getCaptchaToken(config.identity.appVersion);
-          return { verifyParam, region: region || undefined };
+          if (!viaExit) {
+            return getCaptchaToken(appVersion);
+          }
+          try {
+            return await mintViaExit(appVersion, exit);
+          } catch (err) {
+            const msg = (err as Error).message;
+            // Auto node testing: only transport-ish stalls point at the exit
+            // node — a configs-fetch failure ("Captcha config unavailable")
+            // is direct from the main process and rotation cannot fix it.
+            if (config.claim.exitAutoRotate === false || !looksLikeMintStall(msg)) throw err;
+            const pool = auth.getPool();
+            const targets = pool?.exitTargets() ?? [];
+            if (targets.length === 0) throw err;
+            // Candidates: nodes AFTER the current one in listener order (46
+            // nodes, ≤ a handful in use — wrapping adds nothing), never the
+            // current node and never an exit another account is using.
+            const usedUrls = new Set(
+              (pool?.snapshotEntries() ?? [])
+                .filter((e) => e.id !== id && e.proxyUrl)
+                .map((e) => e.proxyUrl as string),
+            );
+            const currentIndex = targets.findIndex((t) => t.url === exit);
+            const candidates = targets.filter(
+              (t, i) => t.url !== exit && !usedUrls.has(t.url) && i > (currentIndex >= 0 ? currentIndex : -1),
+            );
+            const slice = candidates.slice(0, maxExitProbes);
+            if (slice.length === 0) throw err;
+            const label = entry0?.label ?? id;
+            console.log(
+              `[claim] ${label}: exit ${entry0?.proxyLabel ?? "?"} stalled the captcha mint — probing ${slice.length} alternative node(s): ${slice.map((t) => t.label).join(", ")}`,
+            );
+            for (const cand of slice) {
+              const t0 = Date.now();
+              try {
+                // The probe IS a real mint; on success the token is used for
+                // the claim (zero wasted mints) and the pin moves so the
+                // claim POST egresses from the same node that minted it.
+                const token = await mintViaExit(appVersion, cand.url);
+                await pinSaver(id, cand.label);
+                console.log(
+                  `[claim] ${label}: exit rotated ${entry0?.proxyLabel ?? "?"} → ${cand.label} (mint ok in ${((Date.now() - t0) / 1000).toFixed(1)}s) — pinned`,
+                );
+                return token;
+              } catch (probeErr) {
+                console.log(
+                  `[claim] ${label}: node ${cand.label} failed the mint probe (${((Date.now() - t0) / 1000).toFixed(1)}s): ${(probeErr as Error).message.slice(0, 120)}`,
+                );
+              }
+            }
+            console.log(`[claim] ${label}: no healthy alternative exit — keeping ${entry0?.proxyLabel ?? "?"}, retry next cycle`);
+            throw err;
+          }
         },
         config: {
           planId: config.claim.planId || undefined,
