@@ -129,4 +129,39 @@ describe("captcha worker dispatch (worker / in-process)", () => {
       delete process.env.ZCODE_CAPTCHA_WORKER;
     }
   });
+
+  test("proxyUrl threads through to the worker entry (claim mint via account exit)", async () => {
+    // The egress-consistency seam: the claim plane solves its captcha through
+    // the account's mihomo exit, so the fixture must receive proxyUrl in the
+    // solve message on BOTH backends (worker thread and fork child).
+    const echoFixture = path.join(fixtureDir, "fixture-echo-proxy.cjs");
+    fs.writeFileSync(
+      echoFixture,
+      [
+        'const reply = (post, m) => post({ id: m.id, ok: true, param: m.proxyUrl ? "via:" + m.proxyUrl : "direct" });',
+        'const { parentPort } = require("node:worker_threads");',
+        "if (parentPort) {",
+        "  parentPort.on('message', (m) => reply((r) => parentPort.postMessage(r), m));",
+        "} else if (typeof process.send === 'function') {",
+        "  process.on('message', (m) => reply((r) => process.send(r), m));",
+        "} else { process.exit(3); }",
+      ].join("\n"),
+      "utf8",
+    );
+    mock.module("./captcha-worker-asset.js", () => ({ default: echoFixture }));
+    __resetCaptchaWorkerDispatchForTest();
+    // Worker-thread backend (default env).
+    expect(await solveViaWorkerOrInProcess({ scene: "s", region: "r", prefix: "p", proxyUrl: "http://127.0.0.1:47001" }))
+      .toBe("via:http://127.0.0.1:47001");
+    expect(await solveViaWorkerOrInProcess({ scene: "s", region: "r", prefix: "p" })).toBe("direct");
+    // Fork backend (env=off) — same protocol, same field.
+    process.env.ZCODE_CAPTCHA_WORKER = "off";
+    try {
+      __resetCaptchaWorkerDispatchForTest();
+      expect(await solveViaWorkerOrInProcess({ scene: "s", region: "r", prefix: "p", proxyUrl: "http://127.0.0.1:47002" }))
+        .toBe("via:http://127.0.0.1:47002");
+    } finally {
+      delete process.env.ZCODE_CAPTCHA_WORKER;
+    }
+  });
 });

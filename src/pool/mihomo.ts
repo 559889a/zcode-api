@@ -186,6 +186,26 @@ export async function startMihomoPool(config: ProxyConfig): Promise<MihomoRuntim
   let child: ChildProcess | null = null;
   let stopping = false;
   let restarts = 0;
+  // Hang watchdog: a HUNG mihomo (listeners still bound, core dead — observed
+  // after an overnight host sleep/resume, 2026-10-07) never exits, so the
+  // restart-on-exit path below can't fire. Probe the first listener
+  // periodically; after consecutive misses kill the child — the exit handler
+  // then respawns it through the normal backoff path. `ponytail:` ceiling —
+  // one probe port only; a hang limited to other listeners goes unnoticed.
+  let hangMisses = 0;
+  const watchdog: ReturnType<typeof setInterval> = setInterval(() => {
+    if (stopping || !child) return;
+    void probeReady(endpointPort(endpoints[0].url), 3_000).then((alive) => {
+      if (stopping) return;
+      hangMisses = alive ? 0 : hangMisses + 1;
+      if (hangMisses >= 3) {
+        console.error("[proxy-pool] mihomo listeners unresponsive — killing the hung process for restart");
+        hangMisses = 0;
+        try { child?.kill(); } catch {}
+      }
+    });
+  }, 60_000);
+  watchdog.unref?.();
 
   const launch = (): void => {
     child = spawn(binary, ["-d", dirname(path), "-f", path], {
@@ -217,6 +237,7 @@ export async function startMihomoPool(config: ProxyConfig): Promise<MihomoRuntim
 
   const stop = (): void => {
     stopping = true;
+    clearInterval(watchdog);
     child?.kill();
   };
   // Last-resort cleanup if the owner forgets (tests, short-lived CLIs).

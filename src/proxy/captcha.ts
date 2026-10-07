@@ -14,6 +14,7 @@
  * flags it as `verifyCode: F001`. See captcha-happy.ts.
  */
 import { shutdownCaptchaSolver } from "./captcha-solver.js";
+import { solveViaWorkerOrInProcess } from "./captcha-worker-dispatch.js";
 import {
   configureCaptchaPool,
   getCaptchaPoolStats,
@@ -80,6 +81,29 @@ export async function getCaptchaToken(appVersion: string): Promise<{ verifyParam
   // Pre-solved token pool: requests take an already-minted token (sub-ms)
   // while background solves refill -- the hot path never waits on a solve.
   const verifyParam = await takeCaptchaToken(cfg);
+  return { verifyParam, region: cfg.region };
+}
+
+/**
+ * One-shot mint whose HTTP egress goes through `proxyUrl` — the claim plane
+ * uses this so the token's mint IP matches the account exit the claim POST
+ * itself goes out from (risk control flags mint-IP ≠ use-IP as unusual
+ * activity, biz 3012). NOT pooled: shared-pool tokens are minted direct and
+ * would reintroduce the mismatch. One solve attempt — the claim scheduler's
+ * backoff owns retries.
+ */
+export async function solveCaptchaTokenViaProxy(
+  appVersion: string,
+  proxyUrl: string,
+): Promise<{ verifyParam: string; region: string }> {
+  const cfg = await fetchCaptchaConfig(appVersion);
+  if (!cfg || !cfg.enabled || !cfg.prefix || !cfg.sceneId) throw new Error("Captcha config unavailable");
+  const verifyParam = await solveViaWorkerOrInProcess({
+    scene: cfg.sceneId,
+    region: cfg.region,
+    prefix: cfg.prefix,
+    proxyUrl,
+  });
   return { verifyParam, region: cfg.region };
 }
 

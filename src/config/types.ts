@@ -165,6 +165,13 @@ export interface ClaimConfig {
   pollIntervalMs: number;
   /** Backoff after a failed claim attempt in ms. Default `600000` (10 min). */
   cooldownMs: number;
+  /**
+   * Mint the claim captcha token through the account's own exit proxy, so
+   * the token's mint IP matches the IP the claim POST goes out from (risk
+   * control flags mint-IP ≠ use-IP as unusual activity, biz 3012). `false`
+   * falls back to the shared direct-minted token pool. Default `true`.
+   */
+  captchaViaExit: boolean;
   /** Optional `plan_id` to claim; empty string claims the highest-priority preview. Default `""`. */
   planId: string;
 }

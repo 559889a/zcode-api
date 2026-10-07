@@ -13,7 +13,9 @@
  * per-execution, which also removes the cross-solve global races of
  * in-process parallel solving.
  *
- * Protocol: {id, scene, region, prefix} in -> {id, ok, param|error} out.
+ * Protocol: {id, scene, region, prefix, proxyUrl?} in -> {id, ok, param|error}
+ * out. `proxyUrl` routes the solve's HTTP egress through that proxy (claim
+ * minting through the account's exit); absent = direct.
  * Spawned by captcha-worker-dispatch.ts via the captcha-worker-asset.ts
  * file asset (`with { type: "file" }`) -- the only worker mechanism that
  * survives `bun build --compile` single-file binaries (verified on Bun 1.4).
@@ -21,12 +23,17 @@
 import { parentPort } from "node:worker_threads";
 import { solveTraceless } from "./captcha-happy.js";
 
-type SolveMsg = { id: number; scene: string; region: string; prefix: string };
+type SolveMsg = { id: number; scene: string; region: string; prefix: string; proxyUrl?: string };
 type SolveReply = { id: number; ok: true; param: string } | { id: number; ok: false; error: string };
 
 async function handle(m: SolveMsg, post: (reply: SolveReply) => void): Promise<void> {
   try {
-    const param = await solveTraceless({ scene: m.scene, region: m.region, prefix: m.prefix });
+    const param = await solveTraceless({
+      scene: m.scene,
+      region: m.region,
+      prefix: m.prefix,
+      ...(m.proxyUrl ? { proxyUrl: m.proxyUrl } : {}),
+    });
     post({ id: m.id, ok: true, param });
   } catch (err) {
     post({ id: m.id, ok: false, error: String((err as Error)?.message ?? err) });

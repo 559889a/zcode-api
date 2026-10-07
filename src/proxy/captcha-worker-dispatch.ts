@@ -35,6 +35,12 @@ interface SolveRequest {
   scene: string;
   region: string;
   prefix: string;
+  /**
+   * Optional per-solve egress proxy (claim-plane minting through the
+   * account's exit) — the token's mint IP then matches the IP it is used
+   * from. Absent = direct (chat-plane shared-pool behavior, unchanged).
+   */
+  proxyUrl?: string;
 }
 type SolveResponse = { id: number; ok: true; param: string } | { id: number; ok: false; error: string };
 
@@ -46,6 +52,7 @@ type InProcessSolveFn = (opts: {
   scene: string;
   region: string;
   prefix: string;
+  proxyUrl?: string;
 }) => Promise<string>;
 let inProcessOverride: InProcessSolveFn | null = null;
 let happyMod: { solveTraceless: InProcessSolveFn } | null = null;
@@ -132,6 +139,7 @@ export async function solveViaWorkerOrInProcess(req: {
   scene: string;
   region: string;
   prefix: string;
+  proxyUrl?: string;
 }): Promise<string> {
   const entryPath = await getWorkerEntryPath();
   if (workerDisabledByEnv()) {
@@ -183,7 +191,7 @@ export async function solveViaWorkerOrInProcess(req: {
  */
 function solveInWorker(
   entryPath: string,
-  req: { scene: string; region: string; prefix: string },
+  req: { scene: string; region: string; prefix: string; proxyUrl?: string },
 ): Promise<string> {
   const id = ++nextSolveId;
   return new Promise<string>((resolve, reject) => {
@@ -250,7 +258,7 @@ function solveInWorker(
  */
 function solveInChildProcess(
   entryPath: string,
-  req: { scene: string; region: string; prefix: string },
+  req: { scene: string; region: string; prefix: string; proxyUrl?: string },
 ): Promise<string> {
   const id = ++nextSolveId;
   return new Promise<string>((resolve, reject) => {

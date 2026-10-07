@@ -59,7 +59,9 @@ const SYNC_WORKER_SRC = `
         i32[0] = 2; Atomics.notify(i32, 0);
       };
       try {
-        const res = await fetch(m.url, m.init);
+        // Bun-only per-request proxy option (per-solve exit binding); absent
+        // key under other runtimes = plain fetch, unchanged behavior.
+        const res = await fetch(m.url, m.proxy ? { ...m.init, proxy: m.proxy } : m.init);
         const body = Buffer.from(await res.arrayBuffer());
         const headers = {};
         for (const [k, v] of res.headers) headers[k] = v;
@@ -87,7 +89,7 @@ function ensureSyncFetchWorker(): Worker {
   return _syncFetchWorker;
 }
 
-function syncFetchBlocking(url: string, init: Record<string, unknown>, timeoutMs = SYNC_FETCH_TIMEOUT_MS): {
+function syncFetchBlocking(url: string, init: Record<string, unknown>, timeoutMs = SYNC_FETCH_TIMEOUT_MS, proxyUrl?: string): {
   status: number; statusText: string; headers: Record<string, string>;
   setCookie: string[]; body: Buffer;
 } | { error: string } {
@@ -96,7 +98,7 @@ function syncFetchBlocking(url: string, init: Record<string, unknown>, timeoutMs
     const sab = new SharedArrayBuffer(SYNC_FETCH_HEADER_BYTES + SYNC_FETCH_BUF_BYTES);
     const i32 = new Int32Array(sab);
     const u8 = new Uint8Array(sab);
-    worker.postMessage({ sab, url, init });
+    worker.postMessage({ sab, url, init, proxy: proxyUrl });
     const waitResult = Atomics.wait(i32, 0, 0, timeoutMs);
     if (waitResult === "timed-out") return { error: "sync fetch timeout" };
     const dec = new TextDecoder();
@@ -362,7 +364,7 @@ function storeSetCookies(res, url) {
 
 // -- The interceptor: replaces happy-dom's network layer completely ---------
 // All frame requests (scripts, XHR, fetch, images) funnel through here.
-function makeInterceptor(bypassPeCache = false) {
+function makeInterceptor(bypassPeCache = false, proxyUrl?: string) {
   const skipPeCache = (url) => bypassPeCache && /dynamicJS\/.*\/pe\.\d+\./.test(url);
   return {
     async beforeAsyncRequest({ request, window: w }) {
@@ -395,7 +397,11 @@ function makeInterceptor(bypassPeCache = false) {
           });
         }
       }
-      // Passthrough via global fetch (undici; honors global ProxyAgent).
+      // Passthrough via global fetch (undici; honors global ProxyAgent). With
+      // a per-solve proxyUrl (claim-plane minting through the account's exit),
+      // Bun's per-request `proxy` option binds the egress — CDN cache misses
+      // and aliyuncs API calls both flow through here from the SAME exit the
+      // resulting token will be used from.
       try {
         const init = { method: request.method, headers: {} };
         request.headers.forEach((value, key) => {
@@ -414,7 +420,7 @@ function makeInterceptor(bypassPeCache = false) {
             }
           }
         } catch (_) {}
-        const res = await fetch(url, init);
+        const res = await fetch(url, proxyUrl ? { ...init, proxy: proxyUrl } : init);
         const buf = Buffer.from(await res.arrayBuffer());
         storeSetCookies(res, url);
         if (_DEBUG && /captcha-open|verify\.|device\.saf|cloudauth-device|upload\./i.test(url) && buf.length && buf.length < 4096) {
@@ -491,7 +497,7 @@ function makeInterceptor(bypassPeCache = false) {
           if (ab && (ab as any).byteLength > 0) init.body = ab;
         }
       } catch (_) {}
-      const res = syncFetchBlocking(url, init as any) as any;
+      const res = syncFetchBlocking(url, init as any, undefined, proxyUrl) as any;
       if (res.error) {
         process.stderr.write(`[sync-xhr-err] ${url}: ${res.error}\n`);
         return new w.Response("", { status: 503, statusText: "sync fetch failed" });
@@ -1759,14 +1765,19 @@ function waitFor(cond, timeoutMs = 15_000, intervalMs = 40) {
 }
 
 // -- createDom --------------------------------------------------------------
-async function createDom(region, prefix) {
+async function createDom(region, prefix, proxyUrl = null) {
   let cookies = [];
   const now = Date.now();
-  if (_cookieCache.ts > 0 && now - _cookieCache.ts < COOKIE_CACHE_TTL_MS) {
+  // Proxied solves bypass the shared cookie cache both ways: cached cookies
+  // were primed from another egress (IP-context state), and cookies primed
+  // through this exit must not leak into direct-mint solves.
+  if (!proxyUrl && _cookieCache.ts > 0 && now - _cookieCache.ts < COOKIE_CACHE_TTL_MS) {
     cookies = _cookieCache.cookies;
   } else {
     try {
       const res = await fetch("https://zcode.z.ai/", {
+        // Bun-only per-request proxy option; absent under other runtimes.
+        ...(proxyUrl ? { proxy: proxyUrl } : {}),
         headers: {
           "User-Agent": fp.userAgent,
           "sec-ch-ua": '"Chromium";v="' + fp.uaMajor + '", "Not)A;Brand";v="24"',
@@ -1776,11 +1787,11 @@ async function createDom(region, prefix) {
         },
       });
       cookies = typeof res.headers.getSetCookie === "function" ? res.headers.getSetCookie() : [];
-      _cookieCache = { cookies, ts: Date.now() };
+      if (!proxyUrl) _cookieCache = { cookies, ts: Date.now() };
     } catch (_) {}
   }
 
-  const interceptor = makeInterceptor(_bypassPeCacheOnce);
+  const interceptor = makeInterceptor(_bypassPeCacheOnce, proxyUrl);
   _bypassPeCacheOnce = false;
   // Registered once per process -- adding it inside createDom leaked a new
   // EventEmitter listener per solve (MaxListenersExceededWarning + growth).
@@ -2364,21 +2375,28 @@ async function solveTraceless(opts) {
   const scene = opts.scene || "11xygtvd";
   const region = opts.region || "sgp";
   const prefix = opts.prefix || "no8xfe";
+  // Optional per-solve egress proxy (claim-plane minting through the
+  // account's exit, so the token's mint IP == use IP for risk control).
+  // Bun-only per-request fetch option threaded to every HTTP site below.
+  const proxyUrl = opts.proxyUrl || null;
   // Overall solve deadline. On the in-process fallback path a hung solve
   // stalls the main event loop — fail fast and let the pool's retry ladder
   // handle it; the worker path terminates on the same env knob.
   // Override: CAPTCHA_SOLVE_TIMEOUT_MS.
   const timeoutMs = opts.timeoutMs ?? Number(process.env.CAPTCHA_SOLVE_TIMEOUT_MS || 20_000);
 
+  // Pooled windows carry cookie/fingerprint state minted under one egress —
+  // never reuse or bank windows across different exits.
   const wantReuse = opts.reuseWindow ?? process.env.CAPTCHA_WINDOW_REUSE !== "0";
+  const allowReuse = wantReuse && !proxyUrl;
   let dom;
   let reused = false;
-  if (wantReuse) {
+  if (allowReuse) {
     dom = takeReusableWindow();
     if (dom) reused = true;
   }
   if (!dom) {
-    dom = await createDom(region, prefix);
+    dom = await createDom(region, prefix, proxyUrl);
   }
   const { window: w, browserFrame } = dom;
   const solveStart = Date.now();
@@ -2482,7 +2500,7 @@ async function solveTraceless(opts) {
 
     solveSucceeded = true;
     const out = extractVerifyParam(param);
-    if (wantReuse) {
+    if (allowReuse) {
       if (reused) noteWindowSolved();
       else stageReusableWindow(w, browserFrame);
       keepWindow = true;

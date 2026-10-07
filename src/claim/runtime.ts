@@ -9,7 +9,7 @@ import type { PoolEntry } from "../pool/pool.js";
 import type { ClaimablePlan, ClaimOutcome } from "./types.js";
 import { createClaimClient, ClaimPreviewError } from "./client.js";
 import { ClaimScheduler } from "./scheduler.js";
-import { getCaptchaToken } from "../proxy/captcha.js";
+import { getCaptchaToken, solveCaptchaTokenViaProxy } from "../proxy/captcha.js";
 import { loadCredential } from "../auth/store.js";
 
 /** `${process.platform}-${process.arch}` — mirrors the client's `TH()`. */
@@ -86,7 +86,15 @@ export function startAutoClaim(
             },
           }),
         getCaptcha: async () => {
-          const { verifyParam, region } = await getCaptchaToken(config.identity.appVersion);
+          // Mint through the SAME exit the claim POST will use (live lookup):
+          // a token minted direct but used from the account's exit IP is the
+          // mint-IP ≠ use-IP mismatch risk control flags as "unusual
+          // activity" (biz 3012). No exit / opted out → shared direct pool.
+          const exit = findEntry(id)?.proxyUrl;
+          const viaExit = exit && config.claim.captchaViaExit !== false;
+          const { verifyParam, region } = viaExit
+            ? await solveCaptchaTokenViaProxy(config.identity.appVersion, exit)
+            : await getCaptchaToken(config.identity.appVersion);
           return { verifyParam, region: region || undefined };
         },
         config: {

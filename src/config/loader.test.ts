@@ -145,6 +145,7 @@ logging:
       origin: "https://zcode.z.ai",
       pollIntervalMs: 300000,
       cooldownMs: 600000,
+      captchaViaExit: true,
       planId: "",
     });
   });
@@ -300,6 +301,7 @@ claim:
   origin: "https://zcode.z.ai"
   pollIntervalMs: 60000
   cooldownMs: 120000
+  captchaViaExit: false
   planId: "weekend-special"
 `);
     const cfg = loadConfig(path);
@@ -309,6 +311,7 @@ claim:
       origin: "https://zcode.z.ai",
       pollIntervalMs: 60000,
       cooldownMs: 120000,
+      captchaViaExit: false,
       planId: "weekend-special",
     });
   });
