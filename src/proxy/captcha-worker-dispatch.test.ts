@@ -3,6 +3,7 @@ import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
 import {
+  __captchaChildSlotsForTest,
   __resetCaptchaWorkerDispatchForTest,
   __setInProcessSolverForTest,
   solveViaWorkerOrInProcess,
@@ -125,6 +126,46 @@ describe("captcha worker dispatch (worker / in-process)", () => {
     try {
       const param = await solveViaWorkerOrInProcess({ scene: "sc5", region: "rg5", prefix: "pf5" });
       expect(param).toBe("child-param:sc5");
+    } finally {
+      delete process.env.ZCODE_CAPTCHA_WORKER;
+    }
+  });
+
+  test("child backend caps concurrent children and queues the rest (FIFO)", async () => {
+    // 2026-10-07 OOM shape: pool waves + empty-take race can stack 6+ forked
+    // children (~0.3-0.4GB commit each) and exhaust commit on small hosts.
+    // The semaphore must hold active ≤ max with the rest queued, all resolving.
+    const slowFixture = path.join(fixtureDir, "fixture-slow-child.cjs");
+    fs.writeFileSync(
+      slowFixture,
+      [
+        'const reply = (post, m) => setTimeout(() => post({ id: m.id, ok: true, param: "slow:" + m.id }), 600);',
+        'const { parentPort } = require("node:worker_threads");',
+        "if (parentPort) {",
+        "  parentPort.on('message', (m) => reply((r) => parentPort.postMessage(r), m));",
+        "} else if (typeof process.send === 'function') {",
+        "  process.on('message', (m) => reply((r) => process.send(r), m));",
+        "} else { process.exit(3); }",
+      ].join("\n"),
+      "utf8",
+    );
+    mock.module("./captcha-worker-asset.js", () => ({ default: slowFixture }));
+    __resetCaptchaWorkerDispatchForTest();
+    process.env.ZCODE_CAPTCHA_WORKER = "off";
+    try {
+      const solves = Array.from({ length: 4 }, (_, i) =>
+        solveViaWorkerOrInProcess({ scene: `slow${i}`, region: "r", prefix: "p" }),
+      );
+      // Give the first forks time to spawn and hold their slots; the 600ms
+      // fixture delay guarantees nobody has answered yet at this point.
+      await new Promise((r) => setTimeout(r, 400));
+      const slots = __captchaChildSlotsForTest();
+      expect(slots.max).toBeGreaterThanOrEqual(1);
+      expect(slots.active).toBeLessThanOrEqual(slots.max);
+      expect(slots.active + slots.queued).toBe(4);
+      const params = await Promise.all(solves);
+      expect(new Set(params).size).toBe(4);
+      expect(__captchaChildSlotsForTest()).toEqual({ active: 0, queued: 0, max: slots.max });
     } finally {
       delete process.env.ZCODE_CAPTCHA_WORKER;
     }

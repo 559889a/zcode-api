@@ -30,6 +30,23 @@ import { fork, type ChildProcess } from "node:child_process";
 /** Per-solve timeout: overall deadline the worker gets before termination. */
 const SOLVE_WORKER_TIMEOUT_MS = Number(process.env.CAPTCHA_SOLVE_TIMEOUT_MS || 20_000);
 
+// ponytail: ceiling — one forked Bun child costs ~0.3-0.4GB commit and crashes
+// natively at a small rate on worker-unstable hosts; the token pool's 3-lane
+// waves + empty-take race can otherwise stack 6+ children at once and exhaust
+// commit on small hosts (observed 2026-10-07, 8GB RAM → JSC MemoryExhaustion
+// assertions in the children). Cap concurrent children; queued solves wait in
+// FIFO order and are still bounded by the per-solve timeout above. Upgrade
+// path: one persistent sequential-solve child per exit (amortizes the ~1s
+// spawn). Override: CAPTCHA_CHILD_MAX_CONCURRENT.
+const MAX_CONCURRENT_CHILDREN = Math.max(1, Number(process.env.CAPTCHA_CHILD_MAX_CONCURRENT || 2));
+let activeChildren = 0;
+const childQueue: Array<() => void> = [];
+
+/** Test-only: child-backend semaphore state (concurrency assertions). */
+export function __captchaChildSlotsForTest(): { active: number; queued: number; max: number } {
+  return { active: activeChildren, queued: childQueue.length, max: MAX_CONCURRENT_CHILDREN };
+}
+
 interface SolveRequest {
   id: number;
   scene: string;
@@ -158,7 +175,7 @@ export async function solveViaWorkerOrInProcess(req: {
       noteMode("off-no-entry", `[captcha-solver] ${msg}\n`);
       throw new Error(msg);
     }
-    noteMode("child", "[captcha-solver] ZCODE_CAPTCHA_WORKER=off — solving in a child process\n");
+    noteMode("child", `[captcha-solver] ZCODE_CAPTCHA_WORKER=off — solving in a child process (max ${MAX_CONCURRENT_CHILDREN} concurrent)\n`);
     try {
       return await solveInChildProcess(entryPath, req);
     } catch (err) {
@@ -251,10 +268,12 @@ function solveInWorker(
 
 /**
  * One solve = one child process (fork of the same entry bundle). Semantics
- * mirror solveInWorker — fresh execution per solve, forced kill on timeout —
- * with one crucial difference: the child dying mid-solve is a catchable
- * event, so a native crash degrades to in-process solving instead of
- * killing the proxy (the no-AVX2 worker failure shape).
+ * mirror solveInWorker — fresh execution per solve, forced kill on timeout.
+ * A child dying mid-solve is a catchable event: the solve fails and the
+ * CALLER's retry ladder (token pool, or the claim scheduler's cooldown)
+ * decides whether to roll a fresh one — there is deliberately no in-process
+ * fallback here (see solveViaWorkerOrInProcess). Children are capped at
+ * MAX_CONCURRENT_CHILDREN; extra solves queue behind the semaphore.
  */
 function solveInChildProcess(
   entryPath: string,
@@ -264,37 +283,67 @@ function solveInChildProcess(
   return new Promise<string>((resolve, reject) => {
     let settled = false;
     let child: ChildProcess | null = null;
+    let slotHeld = false;
+    const releaseSlot = (): void => {
+      if (!slotHeld) return;
+      slotHeld = false;
+      activeChildren -= 1;
+      childQueue.shift()?.();
+    };
     const settle = (fn: () => void) => {
       if (settled) return;
       settled = true;
       clearTimeout(timer);
       try { child?.kill(); } catch {}
+      releaseSlot();
       fn();
     };
     const timer = setTimeout(() => {
       settle(() => reject(new Error(`captcha child process timeout (${SOLVE_WORKER_TIMEOUT_MS}ms)`)));
     }, SOLVE_WORKER_TIMEOUT_MS);
 
-    try {
-      child = fork(entryPath);
-    } catch (err) {
-      settle(() => reject(new ChildUnavailableError(`captcha child process spawn failed: ${(err as Error).message}`)));
-      return;
-    }
-    child.on("message", (m: SolveResponse) => {
-      if (!m || m.id !== id) return;
-      if (m.ok) settle(() => resolve(m.param));
-      else settle(() => reject(new Error(m.error)));
-    });
-    child.on("error", (err: Error) => {
-      settle(() => reject(new ChildUnavailableError(`captcha child process error: ${err.message}`)));
-    });
-    child.on("exit", (code) => {
-      if (!settled) {
-        settle(() => reject(new ChildUnavailableError(`captcha child process exited (code ${code}) before responding`)));
+    const spawnSolve = (): void => {
+      if (settled) {
+        // Timed out while queued for a slot — pass the slot on immediately.
+        releaseSlot();
+        return;
       }
-    });
-    child.send({ id, ...req } as SolveRequest);
+      try {
+        // silent: the child's stderr (15-line Bun native-crash banners) is
+        // dropped instead of flooding the operator console; its death is
+        // still reported compactly through the exit event below.
+        child = fork(entryPath, [], { silent: true });
+      } catch (err) {
+        settle(() => reject(new ChildUnavailableError(`captcha child process spawn failed: ${(err as Error).message}`)));
+        return;
+      }
+      child.on("message", (m: SolveResponse) => {
+        if (!m || m.id !== id) return;
+        if (m.ok) settle(() => resolve(m.param));
+        else settle(() => reject(new Error(m.error)));
+      });
+      child.on("error", (err: Error) => {
+        settle(() => reject(new ChildUnavailableError(`captcha child process error: ${err.message}`)));
+      });
+      child.on("exit", (code) => {
+        if (!settled) {
+          settle(() => reject(new ChildUnavailableError(`captcha child process exited (code ${code}) before responding`)));
+        }
+      });
+      child.send({ id, ...req } as SolveRequest);
+    };
+
+    if (activeChildren < MAX_CONCURRENT_CHILDREN) {
+      slotHeld = true;
+      activeChildren += 1;
+      spawnSolve();
+    } else {
+      childQueue.push(() => {
+        slotHeld = true;
+        activeChildren += 1;
+        spawnSolve();
+      });
+    }
   });
 }
 

@@ -135,7 +135,13 @@ export class ClaimScheduler {
     try {
       captcha = await this.deps.getCaptcha();
     } catch (err) {
-      return this.errorBackoff(`captcha token failed: ${(err as Error).message}`);
+      const msg = (err as Error).message;
+      // Mint-stall signature (per-fetch timeout / SDK stall / dead exit):
+      // point the operator at the exit node before the next 10-min retry.
+      const stallHint = /timeout|timed out|stall|passthrough failed|sync fetch|sync-xhr/i.test(msg)
+        ? " — captcha minting stalled; if this account mints via an exit node, that node looks slow or dead for captcha endpoints (try another exit: panel → Accounts)"
+        : "";
+      return this.errorBackoff(`captcha token failed: ${msg}${stallHint}`);
     }
 
     let outcome: ClaimOutcome;

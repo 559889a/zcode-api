@@ -420,7 +420,15 @@ function makeInterceptor(bypassPeCache = false, proxyUrl?: string) {
             }
           }
         } catch (_) {}
-        const res = await fetch(url, proxyUrl ? { ...init, proxy: proxyUrl } : init);
+        // Bounded: a stalled egress (proxied minting through a dead mihomo
+        // node) must fail into the 503 below, not hang the child until the
+        // outer solve deadline kills it (observed 2026-10-07: claim mints
+        // dying at the 20s outer timeout with no per-fetch bound).
+        const res = await fetch(url, {
+          ...init,
+          signal: AbortSignal.timeout(SYNC_FETCH_TIMEOUT_MS),
+          ...(proxyUrl ? { proxy: proxyUrl } : {}),
+        });
         const buf = Buffer.from(await res.arrayBuffer());
         storeSetCookies(res, url);
         if (_DEBUG && /captcha-open|verify\.|device\.saf|cloudauth-device|upload\./i.test(url) && buf.length && buf.length < 4096) {
@@ -1777,7 +1785,10 @@ async function createDom(region, prefix, proxyUrl = null) {
     try {
       const res = await fetch("https://zcode.z.ai/", {
         // Bun-only per-request proxy option; absent under other runtimes.
+        // Bounded so a dead exit node cannot stall the child to the outer
+        // solve deadline (same bound as the interceptor's passthrough fetch).
         ...(proxyUrl ? { proxy: proxyUrl } : {}),
+        signal: AbortSignal.timeout(SYNC_FETCH_TIMEOUT_MS),
         headers: {
           "User-Agent": fp.userAgent,
           "sec-ch-ua": '"Chromium";v="' + fp.uaMajor + '", "Not)A;Brand";v="24"',

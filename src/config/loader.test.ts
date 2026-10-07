@@ -143,7 +143,7 @@ logging:
       enabled: true,
       auto: true,
       origin: "https://zcode.z.ai",
-      pollIntervalMs: 300000,
+      pollIntervalMs: 600000,
       cooldownMs: 600000,
       captchaViaExit: true,
       planId: "",

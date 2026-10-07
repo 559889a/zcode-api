@@ -173,8 +173,8 @@ claim:
   # CLI-only (`zcode-proxy claim` still works when `enabled: true`).
   auto: true
   origin: "https://zcode.z.ai"
-  # Preview poll cadence (5 min default).
-  pollIntervalMs: 300000
+  # Preview poll cadence (10 min default).
+  pollIntervalMs: 600000
   # Mint the claim captcha token through the account's OWN exit proxy so the
   # token's mint IP matches the IP the claim POST goes out from (a direct-
   # minted token used from another IP is flagged as unusual activity, biz
