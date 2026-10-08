@@ -144,9 +144,10 @@ async function peekBodyBytes(resp: Response, limit: number): Promise<Uint8Array>
 /**
  * Decode sniff bytes, inflating first when the response is labeled gzip.
  * TextDecoder is non-fatal, so invalid UTF-8 degrades to replacement chars —
- * the ASCII magic strings still match.
+ * the ASCII magic strings still match. Exported for the sibling body-sniffer
+ * (quota-error.ts) which shares the compressed-passthrough transport reality.
  */
-async function decodeMaybeGzip(bytes: Uint8Array, encodingHeader: string | null): Promise<string> {
+export async function decodeMaybeGzip(bytes: Uint8Array, encodingHeader: string | null): Promise<string> {
   const enc = encodingHeader?.toLowerCase().trim() ?? "";
   if (enc === "gzip" || enc === "x-gzip") {
     try {

@@ -185,6 +185,26 @@ export class AccountPool {
     return true;
   }
 
+  /**
+   * Definitive budget exhaustion (upstream biz 1005 quota / 1113 balance,
+   * hidden behind HTTP 200 or 429): cool the entry at once instead of burning
+   * `failureThreshold` requests on an account that cannot serve until the
+   * reset. Revives lazily via the existing all-cooling rule — no cooldown
+   * timer, per the rotation spec.
+   */
+  reportQuotaExhausted(entry: PoolEntry): boolean {
+    const s = this.stateOf(entry);
+    if (s.cooling) return true;
+    s.cooling = true;
+    s.strikes = 0;
+    const idx = this.entries.indexOf(entry);
+    this.onEvent(
+      `${entry.label} quota/balance exhausted (upstream) — cooling until reset, switching to ${this.nextLiveLabel(idx)}`,
+    );
+    if (idx === this.pointer) this.advance(idx);
+    return true;
+  }
+
   /** Live wire-safe snapshot for UIs. */
   status(): PoolStatusEntry[] {
     return this.entries.map((e, i) => {

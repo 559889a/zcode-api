@@ -42,6 +42,23 @@ describe("AccountPool — cooldown", () => {
     expect(pool.acquire()).toBe(entries[1]);
   });
 
+  it("quota exhaustion (biz 1005) cools immediately — one report, pointer moved, no strike ladder", () => {
+    const { pool, entries } = makePool(["a", "b"], 10);
+    expect(pool.reportQuotaExhausted(entries[0])).toBe(true);
+    expect(pool.acquire()).toBe(entries[1]); // a is out right away
+    const st = pool.status();
+    expect(st[0].cooling).toBe(true);
+    expect(st[0].strikes).toBe(0); // not a strike-ladder outcome
+    expect(st[1].current).toBe(true);
+  });
+
+  it("quota exhaustion is idempotent on an already-cooling entry", () => {
+    const { pool, entries } = makePool(["a", "b", "c"]);
+    pool.reportQuotaExhausted(entries[0]);
+    expect(pool.reportQuotaExhausted(entries[0])).toBe(true);
+    expect(pool.acquire()).toBe(entries[1]); // pointer did not move twice
+  });
+
   it("resumes the cooldown ladder from where a revived entry left off is reset (success clears strikes)", () => {
     const { pool, entries } = makePool(["a"], 3);
     pool.reportFailure(entries[0]);

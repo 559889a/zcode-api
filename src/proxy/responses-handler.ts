@@ -23,6 +23,7 @@ import type { ProxyConfig } from "../config/types.js";
 import type { AuthManager } from "../auth/manager.js";
 import { buildUpstreamRequest, buildUpstreamHeaderPairs, type UpstreamHeaderPair } from "./upstream.js";
 import { isCaptchaChallenged, retryOnCaptchaChallenge } from "./captcha-retry.js";
+import { detectQuotaExhausted } from "./quota-error.js";
 import { dispatchWithConnectRetry } from "./handler.js";
 import type * as CaptchaExports from "./captcha.js";
 
@@ -168,6 +169,10 @@ export async function handleResponses(
 
   let upstreamResp: Response | null = null;
   let attempt = 0;
+  // Distinct accounts found budget-dead during THIS request — once every
+  // pool entry has been probed dead, cycling revived entries cannot help
+  // within one request and the quota envelope surfaces to the client.
+  const quotaDeadIds = new Set<string>();
   // Sequential rotation, mirroring the chat hot path (handler.ts): the pool
   // keeps returning the current account; only key-class upstream errors
   // (429/401/403) count strikes, and the attempt cap stops a dead upstream
@@ -289,19 +294,29 @@ export async function handleResponses(
       }
     }
 
-    const keyClassError = upstreamResp.status === 429 || upstreamResp.status === 401 || upstreamResp.status === 403;
+    // Same rotation decision as handler.ts: key-class errors only, plus the
+    // biz-1005 quota envelope that hides behind HTTP 200 + JSON (sniffed) —
+    // definitive daily exhaustion cools the account immediately.
+    const quotaExhausted = entry ? await detectQuotaExhausted(upstreamResp) : false;
+    const keyClassError = quotaExhausted || upstreamResp.status === 429 || upstreamResp.status === 401 || upstreamResp.status === 403;
     if (!entry || !keyClassError) {
       if (entry) pool?.reportSuccess(entry);
       break;
     }
-    pool?.reportFailure(entry);
+    if (quotaExhausted) {
+      pool?.reportQuotaExhausted(entry);
+      quotaDeadIds.add(entry.id);
+      if (pool && quotaDeadIds.size >= pool.size) break; // every account probed dead this request
+    } else {
+      pool?.reportFailure(entry);
+    }
     if (attempt >= maxAttempts) break; // exhausted: surface the last upstream error below
     void upstreamResp.body?.cancel().catch(() => {});
     const retryAfterSec = Number.parseInt(upstreamResp.headers.get("retry-after") ?? "", 10);
     const backoffMs = Number.isFinite(retryAfterSec) && retryAfterSec >= 0
       ? Math.min(retryAfterSec * 1000, 5000)
       : Math.min(500 * attempt, 2000);
-    console.log(`[responses] upstream ${upstreamResp.status} on ${entry.label} — retrying in ${backoffMs}ms (attempt ${attempt}/${maxAttempts})`);
+    console.log(`[responses] upstream ${upstreamResp.status}${quotaExhausted ? " (biz 1005/1113 quota exhausted)" : ""} on ${entry.label} — retrying in ${backoffMs}ms (attempt ${attempt}/${maxAttempts})`);
     if (clientReq.signal.aborted) break;
     await new Promise((r) => setTimeout(r, backoffMs));
   }

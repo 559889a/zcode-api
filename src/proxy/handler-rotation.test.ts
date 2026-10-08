@@ -70,6 +70,14 @@ function rateLimited(status: number, body = '{"error":{"type":"rate_limit"}}'): 
   return new Response(body, { status, headers: { "content-type": "application/json", "retry-after": "0" } });
 }
 
+/** The live biz-1005 wire shape (HTTP 200 + JSON); retry-after: 0 keeps tests sleep-free. */
+function quotaExhausted(): Response {
+  return new Response('{"code":1005,"msg":"exceed quota limit","logid":"x"}', {
+    status: 200,
+    headers: { "content-type": "application/json", "retry-after": "0" },
+  });
+}
+
 describe("proxyRequest — account pool rotation", () => {
   it("retries the same account on 429 until it succeeds (retry-after: 0 keeps the test sleep-free)", async () => {
     const auth = new AuthManager();
@@ -115,6 +123,80 @@ describe("proxyRequest — account pool rotation", () => {
     expect(status[0].cooling).toBe(true);
     expect(status[1].cooling).toBe(false);
     expect(status[1].current).toBe(true);
+  });
+
+  it("rotates on biz-1005 quota exhaustion hidden behind HTTP 200 — cools at once, next account serves", async () => {
+    const auth = new AuthManager();
+    const a = configAccountEntry({ label: "a", provider: "zai", apiKey: "key-a" }, 0);
+    const b = configAccountEntry({ label: "b", provider: "zai", apiKey: "key-b" }, 1);
+    auth.setPool(new AccountPool([a, b], { failureThreshold: 10, onEvent: () => {} }));
+
+    const calls: string[] = [];
+    const fetchMock = (async (req: Request) => {
+      const key = (req.headers.get("authorization") ?? "").replace("Bearer ", "");
+      calls.push(key);
+      // Account a is quota-dead: HTTP 200 + the biz-1005 envelope (the live
+      // 2026-10-08 wire shape). Account b is healthy.
+      if (key === "key-a") {
+        return quotaExhausted();
+      }
+      return new Response(ANTHROPIC_OK, { status: 200, headers: { "content-type": "application/json" } });
+    }) as typeof fetch;
+
+    const resp = await proxyRequest(clientRequest(), "anthropic", { config: TEST_CONFIG, auth, fetchImpl: fetchMock });
+    expect(resp.status).toBe(200);
+    expect(await resp.text()).toBe(ANTHROPIC_OK);
+    expect(calls).toEqual(["key-a", "key-b"]); // cooled after ONE failure — no 10-strike ladder
+    const st = auth.getPool()!.status();
+    expect(st[0].cooling).toBe(true);
+    expect(st[0].strikes).toBe(0);
+    expect(st[1].current).toBe(true);
+  });
+
+  it("every account quota-dead: retries through the pool, then surfaces the 200 envelope verbatim", async () => {
+    const auth = new AuthManager();
+    const entry = configAccountEntry({ label: "a", provider: "zai", apiKey: "key-a" }, 0);
+    auth.setPool(new AccountPool([entry], { failureThreshold: 10, onEvent: () => {} }));
+
+    let calls = 0;
+    const fetchMock = (async (_req: Request) => {
+      calls += 1;
+      return quotaExhausted();
+    }) as typeof fetch;
+
+    const resp = await proxyRequest(clientRequest(), "anthropic", { config: TEST_CONFIG, auth, fetchImpl: fetchMock });
+    // Every pool entry probed budget-dead this request short-circuits the
+    // loop: one probe, envelope surfaced — no pointless revival cycling.
+    expect(calls).toBe(1);
+    expect(resp.status).toBe(200);
+    expect(await resp.text()).toContain('"code":1005');
+  });
+
+  it("biz-1113 insufficient balance behind HTTP 429 cools immediately instead of the 10-strike ladder", async () => {
+    const auth = new AuthManager();
+    const a = configAccountEntry({ label: "a", provider: "zai", apiKey: "key-a" }, 0);
+    const b = configAccountEntry({ label: "b", provider: "zai", apiKey: "key-b" }, 1);
+    auth.setPool(new AccountPool([a, b], { failureThreshold: 10, onEvent: () => {} }));
+
+    const calls: string[] = [];
+    const fetchMock = (async (req: Request) => {
+      const key = (req.headers.get("authorization") ?? "").replace("Bearer ", "");
+      calls.push(key);
+      if (key === "key-a") {
+        // The raw api.z.ai plane's balance-dead shape (captured 2026-10-08).
+        return new Response('{"type":"error","error":{"type":"rate_limit_error","code":"1113","message":"[1113][Insufficient balance or no resource package.]"}}', {
+          status: 429,
+          headers: { "content-type": "application/json", "retry-after": "0" },
+        });
+      }
+      return new Response(ANTHROPIC_OK, { status: 200, headers: { "content-type": "application/json" } });
+    }) as typeof fetch;
+
+    const resp = await proxyRequest(clientRequest(), "anthropic", { config: TEST_CONFIG, auth, fetchImpl: fetchMock });
+    expect(resp.status).toBe(200);
+    expect(await resp.text()).toBe(ANTHROPIC_OK);
+    expect(calls).toEqual(["key-a", "key-b"]); // one probe, not ten strikes
+    expect(auth.getPool()!.status()[0].cooling).toBe(true);
   });
 
   it("never counts 5xx as key failures — passed through untouched, no strikes (shared outages must not burn the pool)", async () => {
