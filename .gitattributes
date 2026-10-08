@@ -9,3 +9,7 @@
 *.jar binary
 *.so binary
 *.png binary
+# Windows batch files must keep CRLF — cmd.exe mangles LF-only batches
+# (commands lose their first characters and fail).
+*.cmd text eol=crlf
+*.bat text eol=crlf
